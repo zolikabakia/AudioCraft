@@ -1,0 +1,11 @@
+[package]
+name = "soundcraft-dsp"
+description = "SoundCraft DSP (vendored from the ArtCraft SoundCraft project, MIT OR Apache-2.0)"
+version = "0.20.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+serde = { version = "1", features = ["derive", "rc"] }
+log = "0.4"
+rustfft = "6"

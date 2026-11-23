@@ -1,0 +1,46 @@
+[package]
+name = "audiocraft"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "AudioCraft: native Rust audio editor and multitrack mixer"
+
+[dependencies]
+soundcraft-dsp = { path = "vendor/soundcraft-dsp" }
+soundcraft-clap-host = { path = "vendor/soundcraft-clap-host" }
+soundcraft-vst3-host = { path = "vendor/soundcraft-vst3-host" }
+roxmltree = "0.20"
+flacenc = "0.4"
+cpal = "0.18.2"
+eframe = { version = "0.37.0", features = ["glow"] }
+egui = "0.37.0"
+hound = "3.5.1"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+rfd = "0.18.0"
+rustfft = "6.4.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+symphonia = { version = "0.6.1", features = ["mp3", "aac", "isomp4", "aiff", "alac"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+# the same winit eframe uses: Linux opens through X11 (XWayland) so dropped files arrive
+winit = "0.30"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+winit = "0.30"
+
+# The Plug-ins panel docks VST3/CLAP editor windows inside the main window (Win32 child windows).
+[target.'cfg(windows)'.dependencies]
+raw-window-handle = "0.6"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Storage_Xps", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+
+[profile.dev]
+# the app itself is optimised too: video frames, peaks and audio loops must run at full speed
+opt-level = 2
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3

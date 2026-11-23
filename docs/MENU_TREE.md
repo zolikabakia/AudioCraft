@@ -1,0 +1,317 @@
+# AudioCraft menu tree
+
+Generated from the source by `tools/system_map.py` (labels and command ids as the menus show them).
+
+### Menu bar
+
+- **File** ▸
+  - **New** ▸
+    - Multitrack Session...
+    - Audio File...
+  - Open...
+  - Import Video File...
+  - **Open Append** ▸
+    - To New... `file.open_append_new`
+    - To Current... `file.open_append_current`
+  - **Open Recent** ▸
+    - Clear Recent
+  - Reveal in Explorer `file.reveal`
+  - Close
+  - Close All `file.close_all`
+  - Close Unused Media `file.close_unused`
+  - Close Session and Its Media `file.close_session_media`
+  - Save
+  - Save As...
+  - Save Selection As... `file.save_selection_as`
+  - Save All `file.save_all`
+  - Revert to Saved `file.revert`
+  - **Import** ▸
+    - File...
+    - Files into Multitrack... `multitrack.insert_files`
+    - Markers from CSV... `marker.import`
+    - Application Settings... `file.import_settings`
+  - **Export** ▸
+    - File... `file.export_file`
+    - **Multitrack Mixdown** ▸
+      - Entire Session... `file.export_mixdown`
+      - Time Selection... `file.export_mixdown_selection`
+    - Session...
+    - Markers to CSV... `marker.export`
+    - Analysis Report... `file.export_report`
+    - Application Settings... `file.export_settings`
+  - Batch Processor... `file.batch_process`
+  - Exit
+- **Edit** ▸
+  - Redo
+  - **Tools** ▸
+    - Move `tool.move`
+    - Razor `tool.razor`
+    - Slip `tool.slip`
+    - Time Selection `tool.time`
+    - Direct Selection `tool.direct_selection`
+    - Marquee Selection `tool.marquee`
+    - Lasso Selection `tool.lasso`
+    - Paintbrush Selection `tool.brush`
+    - Spot Healing Brush `tool.spot_heal`
+  - **Enable Channels** ▸
+  - Cut
+  - Copy
+  - Copy to New `edit.copy_to_new`
+  - Paste
+  - Paste to New
+  - Mix Paste...
+  - Delete
+  - **Ripple Delete** ▸
+    - Selected Clips `edit.ripple_delete_clips`
+    - Time Selection in All Tracks `edit.ripple_delete_time`
+  - Crop
+  - **Select** ▸
+    - Select All
+    - Deselect All
+    - Select Current View `edit.select_view`
+    - Select Playhead to Start `edit.select_to_start`
+    - Select Playhead to End `edit.select_to_end`
+    - Select All Clips in Selected Track `edit.select_track_clips`
+    - Select All Frequencies `spectral.select_all`
+    - Select Inverse (Spectral) `spectral.invert`
+  - **Insert** ▸
+    - Silence...
+    - Marker
+    - Files into Multitrack... `multitrack.insert_files`
+    - Current File into Multitrack
+  - **Marker** ▸
+    - → the marker commands (Add, Next, Previous, Rename, Delete, Export, Import)
+  - **Zero Crossings** ▸
+    - Adjust Selection Inward `edit.zero_cross_in`
+    - Adjust Selection Outward `edit.zero_cross_out`
+  - **Snapping** ▸
+    - Snapping
+  - Batch Process `file.batch_process`
+  - Extract Channels to Mono Files `edit.extract_mono`
+  - Interpret Sample Rate... `edit.interpret_sample_rate`
+  - Frequency Band Splitter... `edit.frequency_band_splitter`
+  - Convert Sample Type...
+  - Gain... `process.gain`
+  - Repair Clipped Peaks `process.declip`
+  - Edit Source File `clip.edit_source`
+  - Detect Video Decoder... `video.detect_decoder`
+  - Keyboard Shortcuts... `edit.keyboard_shortcuts`
+  - **Preferences** ▸
+- **Multitrack** ▸
+  - **Track** ▸
+    - Add Mono Audio Track `track.add_mono`
+    - Add Stereo Audio Track `track.add_stereo`
+    - Duplicate Selected Track `track.duplicate`
+    - Delete Selected Track `track.delete`
+    - Rename Selected Track... `track.rename`
+    - Move Track Up `track.move_up`
+    - Move Track Down `track.move_down`
+    - Mute / Unmute All Tracks `track.mute_all`
+    - Clear All Solos `track.solo_clear`
+    - Show/Hide Volume Automation Lane `view.volume_automation`
+    - Add Volume Automation Point `track.automation_point`
+    - Clear Volume Automation `track.automation_clear`
+  - Insert File
+  - Insert Files... `multitrack.insert_files`
+  - **Mixdown Session to New File** ▸
+    - Entire Session
+    - Time Selection
+  - **Bounce to New Track** ▸
+    - Selected Track `multitrack.bounce_track`
+    - Time Selection `multitrack.bounce_selection`
+  - Metronome
+  - Show Clip Volume Envelopes
+  - Show Clip Pan Envelopes
+  - Snapping
+  - Convert Curves for Audition `session.convert_for_audition`
+- **Clip** ▸
+  - Edit Source File `clip.edit_source`
+  - Edit Original `clip.edit_original`
+  - Split
+  - Split at Markers `clip.split_markers`
+  - Delete
+  - **Ripple Delete** ▸
+    - Selected Clips `edit.ripple_delete_clips`
+    - Time Selection in All Tracks `edit.ripple_delete_time`
+  - Trim to Time Selection `clip.trim_selection`
+  - Trim Start to Playhead `clip.trim_start`
+  - Trim End to Playhead `clip.trim_end`
+  - Mute `clip.mute`
+  - Duplicate `clip.duplicate`
+  - Match Clip Loudness `clip.match_loudness`
+  - **Fade In** ▸
+    - Fade In `clip.fade_in`
+  - **Fade Out** ▸
+    - Fade Out `clip.fade_out`
+  - Crossfade with Next Clip `clip.crossfade`
+  - Global Clip Stretching `view.toggle_clip_stretch`
+  - Clip Effects in Effects Rack `window.clip_effects`
+- **Effects** ▸
+  - → Effects menu (below)
+- **Favorites** ▸
+  - → Favorites menu (below)
+- **View** ▸
+  - Waveform Editor
+  - Multitrack Editor
+  - Show Spectral Frequency Display
+  - Show/Hide Spectral Pitch Display `view.pitch_display`
+  - Auto-scroll During Playback
+  - Show Clip Volume Envelopes
+  - Show Clip Pan Envelopes
+  - Show/Hide Volume Automation Lane `view.volume_automation`
+  - Add Volume Automation Point `track.automation_point`
+  - Clear Volume Automation `track.automation_clear`
+  - Return Playhead to Start on Stop
+  - Zoom In
+  - Zoom Out
+  - Zoom Out Full
+  - Zoom to Selection
+  - Zoom In Amplitude `view.zoom_in_amp`
+  - Zoom Out Amplitude `view.zoom_out_amp`
+  - Reset Amplitude Zoom `view.zoom_reset_amp`
+  - **Markers** ▸
+    - → the marker commands (Add, Next, Previous, Rename, Delete, Export, Import)
+  - **Time Display** ▸
+  - **Status Bar** ▸
+- **Window** ▸
+  - → Window menu (below)
+- **Help** ▸
+  - AudioCraft Help... `help.manual`
+  - Command Palette...
+  - Keyboard Shortcuts
+  - Open Settings Folder `help.settings_folder`
+  - About AudioCraft
+
+### Effects menu
+
+- Show Effects Rack
+- Invert
+- Reverse
+- Silence
+- **Generate** ▸
+  - Speech...
+  - Noise...
+  - DTMF Tones...
+  - Tones...
+  - Silence...
+- Match Loudness...
+- Auto Heal Selection
+- **VST** ▸
+- Scan for Plug-ins
+- Audio Plug-In Manager...
+
+### Favorites menu
+
+
+### Window menu
+
+- **Workspace** ▸
+  - Reset to Saved Layout
+  - Save Changes to this Workspace
+  - Save as New Workspace...
+  - Edit Workspaces...
+- Editor: Mixer
+- Amplitude Statistics (floating)
+- Frequency Analysis (floating)
+
+### Panel ≡ menus (each panel's header)
+
+- Open... `file.open`
+- New Audio File... `file.new`
+- New Multitrack Session... `file.new_session`
+- Close File `file.close`
+- Show Effects Rack `window.effects_rack`
+- Show Markers `window.markers`
+- Clip Effects `window.clip_effects`
+- Track Effects `window.track_effects`
+- Undo `edit.undo`
+- Redo `edit.redo`
+- Reset Indicators `panel.levels_reset`
+- Show Amplitude Statistics `window.amplitude_statistics`
+- Show Frequency Analysis `window.frequency_analysis`
+- Time Display: Decimal `panel.time_decimal`
+- Time Display: Samples `panel.time_samples`
+- Time Display: Seconds `panel.time_seconds`
+- Zoom to Selection `view.zoom_selection`
+- Spectral Frequency Display `view.spectral`
+- Show Clip Volume Envelopes `view.envelopes`
+- Show Clip Pan Envelopes `view.pan_envelopes`
+- Show/Hide Volume Automation Lane `view.volume_automation`
+- Add Volume Automation Point `track.automation_point`
+- Clear Volume Automation `track.automation_clear`
+- Zoom Out Full `view.zoom_full`
+- Reset Frequency Zoom `view.spectral_zoom_reset`
+- Close Essential Sound `window.essential_sound`
+- Pop Out / Dock Plug-in Window `plugins.pop_out`
+- Close All Plug-in Windows `plugins.close_all`
+- Dock Plug-in Windows in the Panel (on/off) `plugins.toggle_dock`
+- Audio Plug-In Manager... `window.plugin_manager`
+- Close Plug-ins Panel `window.plugins`
+- Undock Panel *(shown greyed: not available)*
+- Undock Panel
+- Undock Panel Group *(shown greyed: not available)*
+- Undock Panel Group
+- Close Panel
+- Close Other Panels in Group
+- Maximize Panel Group
+- Reset Workspace
+
+### Commands reached without a menu entry (shortcut, Command Palette, panel buttons)
+
+- Paste to New File (Ctrl+Alt+V) `edit.paste_new`
+- Insert Silence `edit.insert_silence`
+- Delete Selected Keyframes (Del) `keyframes.delete`
+- Deselect Keyframes (Esc) `keyframes.deselect`
+- Logarithmic Spectral Scale `view.spectral_log`
+- Show Spectral Pitch Display `view.spectral_pitch`
+- Play Selected File `files.play`
+- Loop File Playback `files.loop`
+- Auto-Play Files `files.autoplay`
+- Add Marker (M) `marker.add`
+- Go to Next Marker (PgDn) `marker.next`
+- Go to Previous Marker (PgUp) `marker.previous`
+- Rename Marker... `marker.rename`
+- Delete Marker `marker.delete`
+- Play / Stop (Space) `transport.play`
+- Pause `transport.pause`
+- Record (Shift+Space) `transport.record`
+- Toggle Loop `transport.loop`
+- Play Selection `transport.play_selection`
+- Return to Start and Play `transport.return_play`
+- Playhead to Start (Home) `transport.to_start`
+- Playhead to End (End) `transport.to_end`
+- Mixer `view.mixer`
+- Reset Workspace to Saved Layout `window.workspace_reset`
+- Silence Spectral Selection `spectral.silence`
+- Heal Spectral Selection `spectral.heal`
+- Deselect Spectral Selection `spectral.deselect`
+- Attenuate Spectral Selection `spectral.attenuate`
+- Toggle Metronome `view.toggle_metronome`
+- Toggle Snapping `view.toggle_snapping`
+- Toggle Playback Auto-Scroll `view.toggle_auto_scroll`
+- Track Headers: Inputs/Outputs `view.track_header_io`
+- Track Headers: Effects `view.track_header_fx`
+- Track Headers: Sends `view.track_header_sends`
+- Track Headers: EQ `view.track_header_eq`
+- Split at Playhead (Ctrl+K) `clip.split`
+- DC Offset `process.remove_dc`
+- Normalize `process.normalize`
+- Stretch and Pitch `process.stretch_pitch`
+- Capture Noise Print `process.capture_noise_print`
+- Noise Reduction `process.noise_reduction`
+- Generate Tones `generate.tones`
+- Generate Speech... `generate.speech`
+- Generate DTMF Tones `generate.dtmf`
+- Fade Envelope `process.fade_envelope`
+- Gain Envelope `process.gain_envelope`
+- Delete Silence `process.delete_silence`
+- Mark Audio `process.mark_audio`
+- Click/Pop Eliminator `process.click_pop`
+- Automatic Phase Correction `process.phase_correction`
+- Pitch Bender `process.pitch_bender`
+- Generate Noise `generate.noise`
+- Repeat Last Command (Ctrl+R) `edit.repeat_last`
+- Enable Channels: Left `edit.enable_left`
+- Enable Channels: Right `edit.enable_right`
+- Doppler Shifter (process)... `process.doppler`
+- Sound Remover (process)... `process.sound_remover`

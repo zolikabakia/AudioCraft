@@ -1,0 +1,8 @@
+/target
+# extra build folders (a second build while the app is running, the Linux build)
+/target-alt
+/target-linux
+# stray build output once written inside the sources by mistake; safe to delete
+/src/target-alt
+# packaged builds from scripts/build-linux.sh
+/dist
