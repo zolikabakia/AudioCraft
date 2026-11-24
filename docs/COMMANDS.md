@@ -3,6 +3,7 @@
 Every feature is a command with a stable ID. Run commands from the menus, from the keyboard, from the Command Palette (Ctrl+Shift+P), or list them with `audiocraft --list-commands`. This file is generated from that output.
 
 | ID | Title | Shortcut | What it does |
+|---|---|---|---|
 | `file.new` | New Audio File | Ctrl+N | Create an empty audio file (asks for sample rate, channels and bit depth). |
 | `file.new_session` | New Multitrack Session | Ctrl+Shift+N | Create an empty multitrack session. |
 | `file.open` | Open | Ctrl+O | Open a session or AudioCraft project first; audio files and videos are also available. |
