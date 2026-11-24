@@ -714,8 +714,12 @@ pub struct App {
     pub rack_clip_tab: bool,
     pub rack_window: Option<(crate::rack::RackTarget, usize)>,
     pub rack_entire: bool,
-    /// Pre-rendered tracks: track id -> (content hash, rendered audio).
-    pub prerendered: std::collections::HashMap<u64, (u64, Arc<AudioData>)>,
+    /// Pre-render caches: track id -> the rendered stretch and the render that extends it.
+    /// A cache follows the playhead (Preferences > Multitrack > Pre-render) or holds the whole
+    /// track when it fits its share of the cap; outside it the track plays live.
+    pub prerender: std::collections::HashMap<u64, PreCache>,
+    /// When the playing mix last picked up newly rendered audio.
+    pub prerender_pushed: Option<std::time::Instant>,
     /// Effects Rack presets saved by the person (name, slots).
     pub user_presets: Vec<(String, Vec<EffectSlot>)>,
     pub rack_preset_name: String,
@@ -745,9 +749,15 @@ pub struct App {
     pub files_drop_rects_last: Vec<egui::Rect>,
     /// What the track headers show below volume/pan: 0 inputs/outputs, 1 effects, 2 sends, 3 EQ.
     pub header_view: u8,
+    /// The Multitrack Tools in the multitrack view's corner (snapping and the other modifiers)
+    /// are shown.
+    pub show_tools_window: bool,
+    /// The snapping-target checkboxes inside that window are unfolded.
+    pub snap_menu_open: bool,
     /// Global clip stretching: stretch handles on every clip's top corners.
     pub stretch_mode: bool,
-    /// Snapping of clips, drops and the playhead to clip edges, markers and the playhead.
+    /// Snapping of clips, drops and the playhead to the targets picked in the Multitrack
+    /// Tools window (clip edges, markers, ruler marks, the playhead, the session start).
     pub snapping: bool,
     /// The Track EQ window open for this track id.
     pub track_eq_window: Option<u64>,
@@ -888,13 +898,16 @@ impl App {
             rack_clip_tab: false,
             rack_window: None,
             rack_entire: false,
-            prerendered: Default::default(),
+            prerender: Default::default(),
+            prerender_pushed: None,
             user_presets: vec![],
             effect_presets: vec![],
             rack_focus: false,
             files_focus: false,
             files_drop_rects_last: vec![],
             header_view: 0,
+            show_tools_window: true,
+            snap_menu_open: false,
             stretch_mode: false,
             snapping: true,
             track_eq_window: None,
@@ -1089,6 +1102,25 @@ impl App {
                 s.selected_clips = s.selected_clip.into_iter().collect();
                 s.master.show_vol_env = true;
                 s.master.vol_env = vec![(0.0, 0.0), (3.0, -3.0), (6.0, 0.0)];
+            }
+        }
+        // Diagnostic: pick one whole row of clips and one row's empty spans — exactly what
+        // Shift+click picks with the Move tool — so a screenshot can verify how the whole
+        // selection is drawn, without changing the normal demo or saved sessions.
+        if args.iter().any(|a| a == "--selshot") {
+            app.switch_mode(Mode::Multitrack);
+            app.tool = Tool::Move;
+            if let Some(s) = app.session.as_mut() {
+                if let Some(id) = s.tracks.get(1).and_then(|t| t.clips.first().map(|c| c.id)) {
+                    s.select_row_clips(id);
+                }
+                // a point inside the row's first empty span (Shift+click picks from there)
+                let t = s
+                    .gaps_on(0)
+                    .first()
+                    .map(|(a, b)| a + (b - a).min(0.05) * 0.5)
+                    .unwrap_or(0.0);
+                s.select_row_gaps(0, t);
             }
         }
         app
@@ -2024,7 +2056,7 @@ impl App {
     pub fn cut(&mut self) {
         if self.mode == Mode::Multitrack {
             self.copy();
-            self.delete_selected_clip();
+            self.delete_active_clip();
             return;
         }
         if self.cur().map(|f| f.selection.is_some()).unwrap_or(false) {
@@ -2156,6 +2188,8 @@ impl App {
         if let Some(s) = &mut self.session {
             s.selection = None;
             s.selected_clip = None;
+            s.selected_clips.clear();
+            s.selected_gaps.clear();
         }
     }
 
@@ -2199,12 +2233,71 @@ impl App {
     }
 
     pub fn delete_selected_clip(&mut self) {
+        let Some(s) = self.session.as_mut() else {
+            return;
+        };
+        let ids: Vec<u64> = if s.selected_clips.is_empty() {
+            s.selected_clip.into_iter().collect()
+        } else {
+            s.selected_clips.clone()
+        };
+        let gaps = std::mem::take(&mut s.selected_gaps);
+        let mut n = 0;
+        if !gaps.is_empty() {
+            n += crate::filecmds::ripple_delete_gaps(s, &gaps);
+        }
+        if !ids.is_empty() {
+            n += crate::filecmds::delete_clips_plain(s, &ids);
+        }
+        if n > 0 {
+            let label = if ids.len() > 1 {
+                "Delete Clips"
+            } else {
+                "Delete Clip"
+            };
+            self.session_push(label);
+        }
+    }
+
+    /// Cut's other half: the clip picked last goes — the one that was copied (the clip
+    /// clipboard holds a single clip).
+    pub fn delete_active_clip(&mut self) {
         let Some(s) = &mut self.session else { return };
         let Some(id) = s.selected_clip else { return };
         if let Some((t, c)) = s.find_clip(id) {
             s.tracks[t].clips.remove(c);
             s.selected_clip = None;
             self.session_push("Delete Clip");
+        }
+    }
+
+    /// Shift+Delete / Shift+Backspace in the Multitrack editor: ripple delete. Every
+    /// picked clip goes and the gap it leaves closes — the later clips of its track pull
+    /// left — and every picked empty span closes the same way.
+    pub fn ripple_delete_selection(&mut self) {
+        let Some(s) = self.session.as_mut() else {
+            return;
+        };
+        let ids: Vec<u64> = if s.selected_clips.is_empty() {
+            s.selected_clip.into_iter().collect()
+        } else {
+            s.selected_clips.clone()
+        };
+        let gaps = std::mem::take(&mut s.selected_gaps);
+        let mut n = 0;
+        if !gaps.is_empty() {
+            n += crate::filecmds::ripple_delete_gaps(s, &gaps);
+        }
+        if !ids.is_empty() {
+            n += crate::filecmds::ripple_delete_clips(s, &ids);
+        }
+        if n > 0 {
+            let label = if ids.len() > 1 {
+                "Ripple Delete Clips"
+            } else {
+                "Ripple Delete"
+            };
+            self.session_push(label);
         }
     }
 
@@ -2676,10 +2769,10 @@ The take is still open; save it with File > Save As."
         self.update_prerenders();
         let Some(s) = &self.session else { return };
         let files = &self.files;
-        let pre = &self.prerendered;
+        let pre = &self.prerender;
         let mix = s.snapshot_with(
             &|id| files.iter().find(|f| f.id == id).map(|f| f.data.clone()),
-            &|tid| pre.get(&tid).map(|p| p.1.clone()),
+            &|tid| pre.get(&tid).map(|p| p.range()).filter(|r| !r.chunks.is_empty()),
         );
         let mut sh = self.engine.lock();
         if sh.playing && sh.end < 1e8 && !sh.looping {
@@ -2689,50 +2782,291 @@ The take is still open; save it with File > Save As."
         sh.sync_mix_chains();
     }
 
-    /// Render (or re-render) the tracks that have Pre-render on and changed since their last
-    /// render: clips, clip effects and track effects, before the fader. Others are forgotten.
+    /// The content hash a pre-render belongs to: the track as played (minus fader, pan, mute
+    /// and solo, which act after the render) and the files it plays.
+    fn prerender_key(&self, t: &crate::session::Track) -> u64 {
+        let mut tr = t.clone();
+        tr.volume_db = 0.0;
+        tr.pan = 0.0;
+        tr.mute = false;
+        tr.solo = false;
+        tr.name.clear();
+        let fv: u64 = self.files.iter().map(|f| f.version).sum();
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&serde_json::to_string(&tr).unwrap_or_default(), &mut h);
+        std::hash::Hash::hash(&fv, &mut h);
+        std::hash::Hasher::finish(&h)
+    }
+
+    /// Forget pre-renders that no longer match their track (an edit), or whose track has
+    /// Pre-render off, so nothing ever plays stale audio. New renders start in
+    /// [`App::prerender_tick`].
     pub fn update_prerenders(&mut self) {
         let Some(s) = &self.session else {
-            self.prerendered.clear();
+            self.prerender.clear();
             return;
         };
-        let fv: u64 = self.files.iter().map(|f| f.version).sum();
-        let mut keep = std::collections::HashSet::new();
-        let mut todo: Vec<(u64, u64, AudioData)> = vec![];
-        for t in s.tracks.iter().filter(|t| t.prerender) {
-            keep.insert(t.id);
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            std::hash::Hash::hash(&serde_json::to_string(t).unwrap_or_default(), &mut h);
-            std::hash::Hash::hash(&fv, &mut h);
-            let key = std::hash::Hasher::finish(&h);
-            if self.prerendered.get(&t.id).map(|p| p.0) == Some(key) {
-                continue;
-            }
-            let mut one = s.clone();
-            let mut tr = t.clone();
-            tr.volume_db = 0.0;
-            tr.pan = 0.0;
-            tr.mute = false;
-            tr.solo = false;
-            tr.prerender = false;
-            tr.fx.pre_fader = true;
-            let tail = if tr.rack.iter().any(|e| e.enabled) {
-                3.0
-            } else {
-                0.0
+        let want: std::collections::HashMap<u64, u64> = s
+            .tracks
+            .iter()
+            .filter(|t| t.prerender)
+            .map(|t| (t.id, self.prerender_key(t)))
+            .collect();
+        self.prerender
+            .retain(|id, c| want.get(id).is_some_and(|k| *k == c.key));
+    }
+
+    /// Does the track have anything that rings on (track, EQ or clip effects)?
+    fn prerender_has_fx(t: &crate::session::Track) -> bool {
+        t.rack.iter().any(|e| e.enabled)
+            || (t.eq_on && !t.eq.is_empty())
+            || t.clips.iter().any(|c| c.rack.iter().any(|e| e.enabled))
+    }
+
+    /// Start a track's render at `from` (session seconds), with a little pre-roll so its
+    /// effects already ring when the kept audio begins.
+    fn prerender_start(&self, t: &crate::session::Track, key: u64, from: f64) -> Option<PreCache> {
+        let s = self.session.as_ref()?;
+        let mut tr = t.clone();
+        // the render holds clips, clip effects and track effects; the fader, pan, their
+        // automation and mute act on it afterwards, live
+        tr.volume_db = 0.0;
+        tr.pan = 0.0;
+        tr.mute = false;
+        tr.solo = false;
+        tr.prerender = false;
+        tr.fx.pre_fader = true;
+        tr.vol_env.clear();
+        tr.auto.pan_env.clear();
+        tr.auto.params.retain(|p| p.key != "mute");
+        let has_fx = Self::prerender_has_fx(&tr);
+        let content_end = tr.clips.iter().map(|c| c.end()).fold(0.0, f64::max);
+        let mut one = s.clone();
+        one.tracks = vec![tr];
+        one.master_db = 0.0;
+        one.master.mute = false;
+        one.master.rack.clear();
+        one.master.vol_env.clear();
+        one.metronome.on = false;
+        let files = &self.files;
+        let mix = one.snapshot(&|id| files.iter().find(|f| f.id == id).map(|f| f.data.clone()));
+        let rate = s.rate.max(1);
+        let max_tail = if has_fx {
+            self.prefs.prerender_max_tail_s.max(0.0) as f64
+        } else {
+            0.0
+        };
+        let from = from.max(0.0);
+        let preroll_frames = if has_fx {
+            (from.min(2.0) * rate as f64).round() as usize
+        } else {
+            0
+        };
+        let a = from - preroll_frames as f64 / rate as f64;
+        let render = crate::session::MixRender::new(&mix, rate, a, content_end + max_tail);
+        Some(PreCache {
+            key,
+            mix,
+            render,
+            rate,
+            start: a + preroll_frames as f64 / rate as f64,
+            skip: preroll_frames,
+            chunks: vec![],
+            pending: [vec![], vec![]],
+            content_end,
+            end: content_end + max_tail,
+            tail_done: false,
+            quiet: 0,
+            has_fx,
+            window: (from, from),
+        })
+    }
+
+    /// The stretch each pre-rendered track should hold now: the whole track when it fits its
+    /// share of the cache cap, otherwise a window around the playhead (ahead / behind from
+    /// Preferences), never longer than the share.
+    fn prerender_window(&self, c_end: f64, playhead: f64, tracks: usize) -> (f64, f64, bool) {
+        let rate = self.session.as_ref().map(|s| s.rate).unwrap_or(48000).max(1) as f64;
+        let share_bytes =
+            (self.prefs.prerender_cap_mb.max(1.0) as f64 * 1024.0 * 1024.0) / tracks.max(1) as f64;
+        let share_secs = share_bytes / (rate * 8.0);
+        if c_end <= share_secs {
+            return (0.0, c_end, true);
+        }
+        let ahead = self.prefs.prerender_ahead_s.max(0.5) as f64;
+        let behind = self.prefs.prerender_behind_s.max(0.0) as f64;
+        let mut a = (playhead - behind).max(0.0);
+        let mut b = (playhead + ahead).min(c_end);
+        if b - a > share_secs {
+            // the share is smaller than ahead + behind: give each side its part
+            let k = share_secs / (ahead + behind).max(1e-9);
+            a = (playhead - behind * k).max(0.0);
+            b = (a + share_secs).min(c_end);
+        }
+        (a, b.max(a), false)
+    }
+
+    /// Advance the pre-renders for about `budget`: each follows the playhead (or fills the
+    /// whole track when it fits the cap), renders past the last clip until its effects fall
+    /// silent, and hands new audio to the playing mix. True while any render has work left.
+    pub fn prerender_tick(&mut self, budget: std::time::Duration) -> bool {
+        self.update_prerenders();
+        let Some(s) = self.session.as_ref() else {
+            return false;
+        };
+        let tracks: Vec<crate::session::Track> =
+            s.tracks.iter().filter(|t| t.prerender).cloned().collect();
+        if tracks.is_empty() {
+            return false;
+        }
+        let playhead = s.cursor.max(0.0);
+        let n = tracks.len();
+        // plan: (re)start caches and set each one's window
+        for t in &tracks {
+            let key = self.prerender_key(t);
+            let c_end = match self.prerender.get(&t.id) {
+                Some(c) => c.end,
+                None => {
+                    let ce = t.clips.iter().map(|c| c.end()).fold(0.0, f64::max);
+                    ce + if Self::prerender_has_fx(t) {
+                        self.prefs.prerender_max_tail_s.max(0.0) as f64
+                    } else {
+                        0.0
+                    }
+                }
             };
-            let end = tr.clips.iter().map(|c| c.end()).fold(0.0, f64::max) + tail;
-            one.tracks = vec![tr];
-            one.master_db = 0.0;
-            let files = &self.files;
-            let mix = one.snapshot(&|id| files.iter().find(|f| f.id == id).map(|f| f.data.clone()));
-            todo.push((t.id, key, crate::session::mixdown(&mix, s.rate, 0.0, end)));
+            let (wa, wb, whole) = self.prerender_window(c_end, playhead, n);
+            let restart = match self.prerender.get(&t.id) {
+                None => true,
+                Some(c) => {
+                    // the playhead left the rendered stretch (a jump back before it, or
+                    // forward past what is rendered): start over where it is now
+                    (!whole && (playhead < c.start - 1e-3 || playhead > c.rendered_to() + 1.0))
+                        || (whole && c.start > 1e-6)
+                }
+            };
+            if restart {
+                if let Some(c) = self.prerender_start(t, key, wa) {
+                    self.prerender.insert(t.id, c);
+                }
+            }
+            if let Some(c) = self.prerender.get_mut(&t.id) {
+                c.window = (wa, wb);
+                if !whole {
+                    c.trim_before(wa);
+                }
+            }
         }
-        self.prerendered.retain(|id, _| keep.contains(id));
-        for (id, key, d) in todo {
-            self.prerendered.insert(id, (key, Arc::new(d)));
-            self.status = "Track pre-rendered".into();
+        // render, a block at a time per track in turn, until the budget is used
+        let t0 = std::time::Instant::now();
+        let mut ids: Vec<u64> = tracks.iter().map(|t| t.id).collect();
+        ids.sort_unstable();
+        let mut grew = false;
+        loop {
+            let mut any = false;
+            for id in &ids {
+                let Some(c) = self.prerender.get_mut(id) else {
+                    continue;
+                };
+                if !c.wants_more() {
+                    continue;
+                }
+                any = true;
+                grew |= c.step();
+                if t0.elapsed() >= budget {
+                    break;
+                }
+            }
+            if !any || t0.elapsed() >= budget {
+                break;
+            }
         }
+        let busy = self.prerender.values().any(|c| c.wants_more());
+        // hand the new audio to playback (at most ten times a second while rendering)
+        let due = self
+            .prerender_pushed
+            .is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(100));
+        if grew && (due || !busy) {
+            self.prerender_pushed = Some(std::time::Instant::now());
+            self.mix_key.0 = u64::MAX;
+            self.refresh_mix(false);
+            if !busy {
+                self.status = "Track pre-rendered".into();
+            }
+        }
+        busy
+    }
+
+    /// Run the pre-renders until they have nothing left to do at the current playhead.
+    pub fn finish_prerenders(&mut self) {
+        let mut guard = 0;
+        while self.prerender_tick(std::time::Duration::from_secs(3600)) && guard < 1000 {
+            guard += 1;
+        }
+        // make sure playback has the last piece
+        self.mix_key.0 = u64::MAX;
+        self.refresh_mix(false);
+    }
+
+    /// What the pre-render gauge shows: `None` when no track has Pre-render on.
+    pub fn prerender_gauge(&self) -> Option<PrerenderGauge> {
+        let s = self.session.as_ref()?;
+        let ids: Vec<u64> = s
+            .tracks
+            .iter()
+            .filter(|t| t.prerender)
+            .map(|t| t.id)
+            .collect();
+        if ids.is_empty() {
+            return None;
+        }
+        let caches: Vec<&PreCache> = ids.iter().filter_map(|id| self.prerender.get(id)).collect();
+        // the stretch every pre-rendered track has ready, and the stretch they aim for
+        let (mut ra, mut rb) = (f64::NEG_INFINITY, f64::INFINITY);
+        let (mut wa, mut wb) = (f64::INFINITY, f64::NEG_INFINITY);
+        let (mut done_n, mut total_n) = (0.0f64, 0.0f64);
+        let mut bytes = 0usize;
+        for c in &caches {
+            let (a, b) = (c.start, c.rendered_to());
+            ra = ra.max(a);
+            rb = rb.min(b);
+            let w1 = c.window.1.min(c.end);
+            wa = wa.min(c.window.0);
+            wb = wb.max(w1);
+            let want = (w1 - c.window.0).max(0.0);
+            total_n += want;
+            done_n += (b.min(w1) - a.max(c.window.0)).clamp(0.0, want);
+            bytes += c.frames() * 8;
+        }
+        if caches.len() < ids.len() {
+            // a track hasn't started yet: nothing is ready for all of them
+            total_n += 1.0;
+            rb = ra;
+        }
+        if !wa.is_finite() || !wb.is_finite() {
+            wa = 0.0;
+            wb = 0.0;
+        }
+        if !ra.is_finite() {
+            ra = 0.0;
+        }
+        if !rb.is_finite() || rb < ra {
+            rb = ra;
+        }
+        let busy = caches.len() < ids.len() || caches.iter().any(|c| c.wants_more());
+        Some(PrerenderGauge {
+            rendered: (ra.max(0.0), rb.max(0.0)),
+            window: (wa.max(0.0), wb.max(0.0)),
+            progress: if total_n > 0.0 {
+                (done_n / total_n).clamp(0.0, 1.0) as f32
+            } else {
+                1.0
+            },
+            busy,
+            tracks: ids.len(),
+            megabytes: bytes as f32 / (1024.0 * 1024.0),
+            cap_megabytes: self.prefs.prerender_cap_mb,
+        })
     }
 
     pub fn switch_mode(&mut self, m: Mode) {
@@ -3585,4 +3919,135 @@ pub fn unique_take_path(dir: &std::path::Path, stem: &str) -> Result<PathBuf, St
         }
     }
     Err("too many takes with this name".into())
+}
+
+/// One track's pre-render: the audio rendered so far (shared pieces, see
+/// [`crate::session::PreRange`]) and the render that extends it.
+pub struct PreCache {
+    pub key: u64,
+    pub mix: crate::session::Mix,
+    pub render: crate::session::MixRender,
+    pub rate: u32,
+    /// Session time of the first kept frame.
+    pub start: f64,
+    /// Pre-roll frames still to throw away (they only warm the effects up).
+    pub skip: usize,
+    pub chunks: Vec<Arc<[Vec<f32>; 2]>>,
+    /// Frames rendered after the last full piece.
+    pub pending: [Vec<f32>; 2],
+    /// Where the track's last clip ends.
+    pub content_end: f64,
+    /// Where the render stops: the last clip's end plus the effects' tail. Until the tail is
+    /// measured this is the longest tail allowed; once it falls silent it is the real end.
+    pub end: f64,
+    pub tail_done: bool,
+    quiet: usize,
+    pub has_fx: bool,
+    /// The stretch this cache is asked to hold (session seconds).
+    pub window: (f64, f64),
+}
+
+impl PreCache {
+    pub fn frames(&self) -> usize {
+        self.chunks.iter().map(|c| c[0].len()).sum::<usize>() + self.pending[0].len()
+    }
+
+    /// Session time just after the last rendered frame.
+    pub fn rendered_to(&self) -> f64 {
+        self.start + self.frames() as f64 / self.rate.max(1) as f64
+    }
+
+    /// The rendered stretch as playback sees it (the unfinished last piece is copied in as a
+    /// shorter final piece; the cache's own pieces stay full-sized).
+    pub fn range(&self) -> crate::session::PreRange {
+        let mut chunks = self.chunks.clone();
+        if !self.pending[0].is_empty() && self.pending[0].len() == self.pending[1].len() {
+            chunks.push(Arc::new(self.pending.clone()));
+        }
+        crate::session::PreRange {
+            start: self.start,
+            rate: self.rate,
+            chunks,
+        }
+    }
+
+    /// More to render for the current window?
+    pub fn wants_more(&self) -> bool {
+        if self.tail_done && self.rendered_to() >= self.end - 1e-9 {
+            return false;
+        }
+        self.rendered_to() < self.window.1.min(self.end) - 1e-9
+    }
+
+    /// Drop whole pieces that ended before `t` (the playhead moved on).
+    pub fn trim_before(&mut self, t: f64) {
+        let piece = crate::session::PRE_CHUNK as f64 / self.rate.max(1) as f64;
+        while self.chunks.len() > 1 && self.start + piece <= t {
+            self.chunks.remove(0);
+            self.start += piece;
+        }
+    }
+
+    /// Render one block. True when new audio became available to playback.
+    pub fn step(&mut self) -> bool {
+        let before = self.render.reached();
+        let finished = self.render.step(&self.mix, 1);
+        let [mut l, mut r] = self.render.drain();
+        if self.skip > 0 {
+            let k = self.skip.min(l.len());
+            l.drain(..k);
+            r.drain(..k.min(r.len()));
+            self.skip -= k;
+        }
+        // the tail: after the last clip, stop once the effects have been silent for half a
+        // second (a reverb that rings on keeps the render going)
+        if before >= self.content_end - 1e-9 && !l.is_empty() {
+            let peak = l
+                .iter()
+                .chain(r.iter())
+                .fold(0.0f32, |m, v| m.max(v.abs()));
+            if peak < 1e-5 || !self.has_fx {
+                self.quiet += l.len();
+            } else {
+                self.quiet = 0;
+            }
+        }
+        self.pending[0].extend_from_slice(&l);
+        self.pending[1].extend_from_slice(&r);
+        let mut grew = false;
+        let piece = crate::session::PRE_CHUNK;
+        while self.pending[0].len() >= piece && self.pending[1].len() >= piece {
+            let l: Vec<f32> = self.pending[0].drain(..piece).collect();
+            let r: Vec<f32> = self.pending[1].drain(..piece).collect();
+            self.chunks.push(Arc::new([l, r]));
+            grew = true;
+        }
+        let silent_long = self.quiet as f64 >= 0.5 * self.rate as f64
+            || (!self.has_fx && self.rendered_to() >= self.content_end - 1e-9);
+        if (silent_long || finished) && !self.tail_done {
+            self.tail_done = true;
+            self.end = self.rendered_to().max(self.content_end);
+            self.render.set_end(self.end);
+            grew = true;
+        }
+        grew
+    }
+}
+
+/// The pre-render gauge's state (like a video editor's render bar).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PrerenderGauge {
+    /// The stretch every pre-rendered track has ready (plays from rendered audio).
+    pub rendered: (f64, f64),
+    /// The stretch the renders aim to hold now (the whole session, or around the playhead).
+    pub window: (f64, f64),
+    /// 0..=1: how much of the window is rendered.
+    pub progress: f32,
+    /// A render still has work to do.
+    pub busy: bool,
+    /// How many tracks have Pre-render on.
+    pub tracks: usize,
+    /// Memory the rendered audio uses, and the cap from Preferences.
+    pub megabytes: f32,
+    pub cap_megabytes: f32,
 }

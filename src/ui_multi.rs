@@ -5,8 +5,67 @@ use crate::audio;
 use crate::curves;
 use crate::keys::{EnvTarget, KeyView, VKind};
 use crate::theme::{self, Icon};
-use crate::ui_wave::{draw_ruler, draw_wave};
+use crate::ui_wave::{draw_ruler, draw_wave, ruler_ticks};
 use egui::{Color32, FontId, Pos2, Rect, Sense, Stroke, pos2, vec2};
+
+/// Every time a drag with Snapping on can stick to, given the person's snapping-target
+/// settings (the magnet menu in the Multitrack Tools corner, Preferences > Multitrack).
+/// `span`/`width` are the visible timeline span and lane width, so the time-display targets
+/// are the ruler's labelled (major) marks; `view` is the visible time range.
+pub fn collect_snap_targets(
+    s: &crate::session::Session,
+    p: &crate::prefs::Prefs,
+    cursor: f64,
+    span: f64,
+    lanes_width: f32,
+    view: (f64, f64),
+) -> Vec<f64> {
+    collect_snap_targets_except(s, p, cursor, span, lanes_width, view, None)
+}
+
+/// [`collect_snap_targets`] without the edges of clip `except` (the clip being dragged: its
+/// own edges move with it). Every other clip's starts and ends count, on its own track and on
+/// the tracks above and below, so a dragged clip or a trimmed edge lines up with any of them.
+pub fn collect_snap_targets_except(
+    s: &crate::session::Session,
+    p: &crate::prefs::Prefs,
+    cursor: f64,
+    span: f64,
+    lanes_width: f32,
+    view: (f64, f64),
+    except: Option<u64>,
+) -> Vec<f64> {
+    let mut v: Vec<f64> = Vec::new();
+    if p.snap_session_start {
+        v.push(0.0);
+    }
+    if p.snap_playhead {
+        v.push(cursor);
+    }
+    for t in &s.tracks {
+        for c in t.clips.iter().filter(|c| Some(c.id) != except) {
+            if p.snap_clip_starts {
+                v.push(c.start);
+            }
+            if p.snap_clip_ends {
+                v.push(c.end());
+            }
+        }
+    }
+    if p.marker_snap {
+        v.extend(s.markers.iter().map(|m| m.time));
+    }
+    if p.snap_time_display && lanes_width > 1.0 && span > 0.0 {
+        let (major, _) = ruler_ticks(span, lanes_width);
+        let mut t = (view.0 / major).floor() * major;
+        // one tick past the right edge, so drags near the edges still snap
+        while t <= view.1 + major {
+            v.push(t);
+            t += major;
+        }
+    }
+    v
+}
 
 #[derive(Default, Clone, Copy, PartialEq, Debug)]
 pub enum MDrag {
@@ -108,6 +167,29 @@ pub enum MDrag {
     },
 }
 
+impl MDrag {
+    /// A drag of a real object (a clip, a keyframe, a handle) that Shift can lock to the main
+    /// 8 directions. View drags (the navigators, the marquee selection) are not locked.
+    pub fn is_object_drag(self) -> bool {
+        matches!(
+            self,
+            MDrag::Move { .. }
+                | MDrag::TrimL { .. }
+                | MDrag::TrimR { .. }
+                | MDrag::FadeIn { .. }
+                | MDrag::FadeOut { .. }
+                | MDrag::Slip { .. }
+                | MDrag::StretchL { .. }
+                | MDrag::StretchR { .. }
+                | MDrag::Env { .. }
+                | MDrag::PanEnv { .. }
+                | MDrag::FadePt { .. }
+                | MDrag::ClipGain { .. }
+                | MDrag::AutoPoint { .. }
+        )
+    }
+}
+
 #[derive(Default)]
 pub struct MultiDrag {
     pub drag: MDrag,
@@ -121,12 +203,26 @@ pub struct MultiDrag {
     pub key_sel_seen: crate::keys::KeySel,
     /// The clip selection (main clip, all selected clips) at the last selection check.
     pub clip_sel_seen: (Option<u64>, Vec<u64>),
+    /// The selected empty spans at the last selection check (they share the clip selection).
+    pub gap_sel_seen: Vec<crate::session::GapSel>,
     pub key_drag: Option<crate::keys::KeyDrag>,
     pub key_hovered: bool,
     /// Where each keyframe was drawn last frame (for tests and hit checks).
     pub key_spots: Vec<(crate::keys::EnvTarget, usize, egui::Pos2)>,
+    /// Where each Multitrack Tools button was drawn last frame (for tests and hit checks).
+    pub tool_spots: Vec<(u8, Rect)>,
+    /// The corner panel the Multitrack Tools sit in last frame (for tests and hit checks).
+    pub tool_panel: Option<Rect>,
+    /// Where the pre-render gauge was drawn last frame (tests).
+    pub prerender_bar: Option<Rect>,
+    /// The time a dragged clip edge (trim or stretch) is snapped to, for the snap line.
+    pub edge_snap: Option<f64>,
     /// Where a fade-handle drag started (pointer y) and the fade's shape then.
     pub fade_start: (f32, f32),
+    /// The clips a Move drag takes with it, recorded where each sat when the drag began:
+    /// the whole selection when the grabbed clip is one of several picked, plus its
+    /// group. Empty unless a Move drag is on.
+    pub crew: Vec<(u64, f64, usize)>,
 }
 
 impl App {
@@ -199,6 +295,18 @@ pub fn clip_gain_drag(db0: f32, y0: f32, y: f32) -> f32 {
         v.clamp(-96.0, 24.0)
     } else {
         db0
+    }
+}
+
+/// One click on a clip. Where the black mouse tool grabs — anywhere with the Move tool,
+/// or any tool over a clip's top bar, the one grab zone every tool shares — Shift+click
+/// selects every clip of the clicked clip's row and Ctrl+click toggles just that clip.
+/// Elsewhere the tool keeps its own click, which selects the clip alone.
+fn pick_clip(s: &mut crate::session::Session, id: u64, grab: bool, shift: bool, ctrl: bool) {
+    if grab && shift {
+        s.select_row_clips(id);
+    } else {
+        s.select_clips(id, grab && ctrl);
     }
 }
 
@@ -314,8 +422,11 @@ fn automation_disclosure(ui: &mut egui::Ui, open: bool, tip: &str) -> egui::Resp
     let c = r.center();
     let st = Stroke::new(1.4, col);
     if open {
-        p.line_segment([pos2(c.x - 5.0, c.y - 2.0), pos2(c.x, c.y + 3.0)], st);
-        p.line_segment([pos2(c.x + 5.0, c.y - 2.0), pos2(c.x, c.y + 3.0)], st);
+        // the open (down) chevron is as wide as the closed one is tall, and starts where the
+        // closed one does, so it never reaches into the track's colour strip on the left
+        let cx = c.x + 0.5;
+        p.line_segment([pos2(cx - 4.0, c.y - 2.0), pos2(cx, c.y + 2.0)], st);
+        p.line_segment([pos2(cx + 4.0, c.y - 2.0), pos2(cx, c.y + 2.0)], st);
     } else {
         p.line_segment([pos2(c.x - 2.0, c.y - 5.0), pos2(c.x + 3.0, c.y)], st);
         p.line_segment([pos2(c.x - 2.0, c.y + 5.0), pos2(c.x + 3.0, c.y)], st);
@@ -428,13 +539,19 @@ enum HeadGlyph {
     Eq,
     Metronome,
     Stretch,
-    Snap,
     AutoScroll,
 }
 
-/// A toolbar toggle above the track headers, highlighted blue when on.
-fn head_tool(ui: &mut egui::Ui, g: HeadGlyph, on: bool, tip: &str) -> egui::Response {
-    let (r, resp) = ui.allocate_exact_size(vec2(24.0, 22.0), Sense::click());
+/// A toolbar toggle at a chosen size (the corner panel's rows are shorter than the old strip).
+fn head_tool_sized(
+    ui: &mut egui::Ui,
+    g: HeadGlyph,
+    on: bool,
+    tip: &str,
+    size: egui::Vec2,
+    icon: f32,
+) -> egui::Response {
+    let (r, resp) = ui.allocate_exact_size(size, Sense::click());
     let p = ui.painter();
     // every button has its own face (not the layers behind it)
     let bg = theme::control_fill(on, theme::selected(), &resp, true);
@@ -445,14 +562,14 @@ fn head_tool(ui: &mut egui::Ui, g: HeadGlyph, on: bool, tip: &str) -> egui::Resp
         theme::text()
     };
     let c = r.center();
-    let ir = Rect::from_center_size(c, vec2(16.0, 16.0));
+    let ir = Rect::from_center_size(c, vec2(icon, icon));
     let def = match g {
         HeadGlyph::Fx => {
             p.text(
                 c,
                 egui::Align2::CENTER_CENTER,
                 "fx",
-                FontId::new(15.0, egui::FontFamily::Proportional),
+                FontId::new(icon + 1.0, egui::FontFamily::Proportional),
                 col,
             );
             None
@@ -462,13 +579,65 @@ fn head_tool(ui: &mut egui::Ui, g: HeadGlyph, on: bool, tip: &str) -> egui::Resp
         HeadGlyph::Eq => Some(&crate::lucide::EQ),
         HeadGlyph::Metronome => Some(&crate::lucide::METRONOME),
         HeadGlyph::Stretch => Some(&crate::lucide::STRETCH),
-        HeadGlyph::Snap => Some(&crate::lucide::MAGNET),
         HeadGlyph::AutoScroll => Some(&crate::lucide::AUTOSCROLL),
     };
     if let Some(d) = def {
         crate::lucide::draw(p, ir, d, col);
     }
     resp.on_hover_text(tip)
+}
+
+/// The snapping split button, in the same design style as the other drop-down controls: one
+/// rounded face, the magnet on the left (toggles snapping) and a small arrow on the right
+/// (opens the snapping-targets dropdown). Returns the magnet's and the arrow's responses.
+fn snap_split_button(
+    ui: &mut egui::Ui,
+    on: bool,
+    open: bool,
+    snap_tip: &str,
+    menu_tip: &str,
+) -> (egui::Response, egui::Response) {
+    let size = vec2(24.0, 22.0);
+    let (r, hov) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let hover = hov.hovered();
+    let menu_zone_w = 9.0;
+    let toggle_r = Rect::from_min_max(r.min, pos2(r.right() - menu_zone_w, r.bottom()));
+    let menu_r = Rect::from_min_max(pos2(r.right() - menu_zone_w, r.top()), r.max);
+    let toggle = ui.interact(toggle_r, ui.id().with("snap_toggle"), egui::Sense::click());
+    let menu = ui.interact(menu_r, ui.id().with("snap_menu"), egui::Sense::click());
+    let p = ui.painter();
+    // the same face the other corner buttons use (on state tinted, hover and press shown)
+    let bg = if on {
+        theme::selected()
+    } else if toggle.is_pointer_button_down_on() || menu.is_pointer_button_down_on() {
+        theme::pressed()
+    } else if hover {
+        theme::hover()
+    } else {
+        theme::control()
+    };
+    p.rect_filled(r.shrink2(vec2(0.5, 0.0)), theme::ROUND as f32, bg);
+    let col = if on || hover {
+        theme::strong()
+    } else {
+        theme::text()
+    };
+    let ir = Rect::from_center_size(pos2(toggle_r.center().x, r.center().y), vec2(12.0, 12.0));
+    crate::lucide::draw(p, ir, &crate::lucide::MAGNET, col);
+    let chev = Rect::from_center_size(
+        pos2(r.right() - menu_zone_w * 0.5, r.center().y + 1.0),
+        vec2(6.0, 6.0),
+    );
+    crate::lucide::draw(
+        p,
+        chev,
+        &crate::lucide::CHEVRON_DOWN,
+        if open { theme::strong() } else { col },
+    );
+    (
+        toggle.on_hover_text(snap_tip),
+        menu.on_hover_text(menu_tip),
+    )
 }
 
 /// Width of the coloured strip at the left of each track header.
@@ -969,10 +1138,16 @@ impl App {
             .as_ref()
             .map(|s| (s.selected_clip, s.selected_clips.clone()))
             .unwrap_or_default();
+        let gaps_now = self
+            .session
+            .as_ref()
+            .map(|s| s.selected_gaps.clone())
+            .unwrap_or_default();
         let keys_changed = keys_now != self.multi_drag.key_sel_seen;
-        let clips_changed = clips_now != self.multi_drag.clip_sel_seen;
+        let clips_changed =
+            clips_now != self.multi_drag.clip_sel_seen || gaps_now != self.multi_drag.gap_sel_seen;
         let keys_on = keys_now.target.is_some() && !keys_now.idx.is_empty();
-        let clips_on = clips_now.0.is_some() || !clips_now.1.is_empty();
+        let clips_on = clips_now.0.is_some() || !clips_now.1.is_empty() || !gaps_now.is_empty();
         if keys_changed && keys_on {
             if let Some(s) = self.session.as_mut() {
                 // the keyframe's own track stays the current track, but no clip stays selected
@@ -994,10 +1169,153 @@ impl App {
             .as_ref()
             .map(|s| (s.selected_clip, s.selected_clips.clone()))
             .unwrap_or_default();
+        self.multi_drag.gap_sel_seen = self
+            .session
+            .as_ref()
+            .map(|s| s.selected_gaps.clone())
+            .unwrap_or_default();
+    }
+
+    /// The Multitrack Tools back in the corner where they were: what the track headers show,
+    /// then the global toggles (metronome, stretching, snapping with its target dropdown,
+    /// auto-scroll), one row at the size the old tools strip used. The time-format selector
+    /// lives in the Selection/View panel. The tools are pinned to the corner as their own top
+    /// layer (Order::Middle, not movable), so however tall the tracks grow and wherever they
+    /// scroll, nothing on the tracks can cover the buttons or take their clicks;
+    /// View > Multitrack Tools hides the tool row again.
+    fn multitrack_tools_corner(&mut self, ui: &mut egui::Ui, panel: Rect) {
+        let mut open_prefs_multi = false;
+        egui::Area::new(egui::Id::new("multitrack_tools"))
+            .order(egui::Order::Middle)
+            .movable(false)
+            .fixed_pos(panel.min)
+            .show(ui.ctx(), |ui| {
+                ui.set_width(panel.width());
+                if self.show_tools_window {
+                    let row = Rect::from_min_max(
+                        pos2(panel.left() + 2.0, panel.top() + 5.0),
+                        pos2(panel.right() - 2.0, panel.bottom() - 5.0),
+                    );
+                    let mut r2 = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(row)
+                            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    );
+                    r2.spacing_mut().item_spacing.x = 2.0;
+                    let size = vec2(24.0, 22.0);
+                    for (m, g, tip) in [
+                        (0u8, HeadGlyph::Io, "Inputs/Outputs"),
+                        (1, HeadGlyph::Fx, "Effects"),
+                        (2, HeadGlyph::Sends, "Sends"),
+                        (3, HeadGlyph::Eq, "EQ"),
+                    ] {
+                        let r = head_tool_sized(&mut r2, g, self.header_view == m, tip, size, 15.0);
+                        self.multi_drag.tool_spots.push((m, r.rect));
+                        if r.clicked() {
+                            self.header_view = m;
+                        }
+                    }
+                    let metro_on = self
+                        .session
+                        .as_ref()
+                        .map(|s| s.metronome.on)
+                        .unwrap_or(false);
+                    let metro = head_tool_sized(
+                        &mut r2,
+                        HeadGlyph::Metronome,
+                        metro_on,
+                        "Toggle Metronome",
+                        size,
+                        15.0,
+                    );
+                    self.multi_drag.tool_spots.push((4, metro.rect));
+                    if metro.clicked() {
+                        if let Some(s) = self.session.as_mut() {
+                            s.metronome.on = !metro_on;
+                            s.touch();
+                        }
+                    }
+                    let stretch = head_tool_sized(
+                        &mut r2,
+                        HeadGlyph::Stretch,
+                        self.stretch_mode,
+                        "Toggle Global Clip Stretching",
+                        size,
+                        15.0,
+                    );
+                    self.multi_drag.tool_spots.push((5, stretch.rect));
+                    if stretch.clicked() {
+                        self.stretch_mode = !self.stretch_mode;
+                    }
+                    // Snapping is a split button in the same design style as the other
+                    // drop-downs: the magnet side toggles snapping, the small arrow side opens
+                    // its target dropdown.
+                    let (snap, targets) = snap_split_button(
+                        &mut r2,
+                        self.snapping,
+                        self.snap_menu_open,
+                        "Toggle Snapping",
+                        "Snapping Targets",
+                    );
+                    self.multi_drag.tool_spots.push((6, snap.rect));
+                    if snap.clicked() {
+                        self.snapping = !self.snapping;
+                    }
+                    self.multi_drag.tool_spots.push((7, targets.rect));
+                    // the snap targets are a real drop-down menu, the same kind (look, place,
+                    // open/close behaviour) as every other drop-down in the app: it opens under
+                    // the arrow, stays open while boxes are ticked, and closes on a click
+                    // anywhere else or on the arrow again
+                    let popup_id = egui::Id::new("snap_targets_popup");
+                    egui::Popup::menu(&targets)
+                        .id(popup_id)
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                        .align(egui::RectAlign::BOTTOM_START)
+                        .show(|ui| {
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            ui.label(
+                                egui::RichText::new("Snap to")
+                                    .small()
+                                    .color(theme::text_dim()),
+                            );
+                            ui.checkbox(
+                                &mut self.prefs.snap_time_display,
+                                "Time display (ruler marks)",
+                            );
+                            ui.checkbox(&mut self.prefs.snap_clip_starts, "Clip starts");
+                            ui.checkbox(&mut self.prefs.snap_clip_ends, "Clip ends");
+                            ui.checkbox(&mut self.prefs.marker_snap, "Markers");
+                            ui.checkbox(&mut self.prefs.snap_playhead, "Playhead");
+                            ui.checkbox(&mut self.prefs.snap_session_start, "Session start");
+                            ui.separator();
+                            if ui.button("Snapping Preferences...").clicked() {
+                                open_prefs_multi = true;
+                                ui.close();
+                            }
+                        });
+                    self.snap_menu_open = egui::Popup::is_id_open(ui.ctx(), popup_id);
+                    let auto = head_tool_sized(
+                        &mut r2,
+                        HeadGlyph::AutoScroll,
+                        self.auto_scroll,
+                        "Toggle Playback Auto-Scroll",
+                        size,
+                        15.0,
+                    );
+                    self.multi_drag.tool_spots.push((8, auto.rect));
+                    if auto.clicked() {
+                        self.auto_scroll = !self.auto_scroll;
+                    }
+                }
+            });
+        if open_prefs_multi {
+            self.open_prefs("Multitrack");
+        }
     }
 
     pub fn multitrack_view(&mut self, ui: &mut egui::Ui) {
         self.keys_take_selection();
+        self.multi_drag.tool_spots.clear();
         let full = ui.max_rect();
         let p = ui.painter_at(full);
         p.rect_filled(full, 0.0, theme::panel());
@@ -1199,6 +1517,67 @@ impl App {
 
         // ---------- ruler
         draw_ruler(&p, ruler, view.0, view.1);
+        // the pre-render gauge: a thin bar along the ruler's top edge (like a video editor's
+        // render bar) whenever a track has Pre-render on. It follows the render window: faded
+        // over the stretch the renders aim to hold (the whole session when it fits the cache
+        // cap, otherwise around the playhead), filled where every pre-rendered track is
+        // ready, with the moving edge marked; all in the theme's colours
+        if let Some(g) = self.prerender_gauge() {
+            let bar = Rect::from_min_max(ruler.min, pos2(ruler.right(), ruler.top() + 4.0));
+            self.multi_drag.prerender_bar = Some(bar);
+            let clip_x = |x: f32| x.clamp(bar.left(), bar.right());
+            let span_rect = |a: f64, b: f64| {
+                Rect::from_min_max(
+                    pos2(clip_x(x_of(a)), bar.top()),
+                    pos2(clip_x(x_of(b)), bar.bottom()),
+                )
+            };
+            let w = span_rect(g.window.0, g.window.1);
+            if w.width() > 0.0 {
+                p.rect_filled(w, 0.0, theme::render_todo());
+            }
+            let d = span_rect(g.rendered.0, g.rendered.1);
+            if d.width() > 0.0 {
+                p.rect_filled(d, 0.0, theme::render_done());
+            }
+            let xr = x_of(g.rendered.1);
+            if g.busy && xr >= bar.left() && xr <= bar.right() {
+                p.rect_filled(
+                    Rect::from_min_max(pos2(xr - 1.0, bar.top()), pos2(xr + 1.0, bar.bottom() + 1.0)),
+                    0.0,
+                    theme::render_edge(),
+                );
+            }
+            let hover = ui.interact(
+                Rect::from_min_max(bar.min, pos2(bar.right(), bar.bottom() + 2.0)),
+                ui.scope_id().with("prerender_gauge"),
+                Sense::hover(),
+            );
+            let tracks = format!(
+                "{} track{}",
+                g.tracks,
+                if g.tracks == 1 { "" } else { "s" }
+            );
+            let fmt = self.time_format;
+            let rate = self.rate();
+            let when = format!(
+                "{} - {}",
+                fmt.format(g.rendered.0, rate),
+                fmt.format(g.rendered.1, rate)
+            );
+            hover.on_hover_text(format!(
+                "{}\nReady: {when}\nCache: {:.0} of {:.0} MB",
+                if g.busy {
+                    format!("Pre-rendering {tracks}: {:.0}%", g.progress * 100.0)
+                } else {
+                    format!("{tracks} pre-rendered")
+                },
+                g.megabytes,
+                g.cap_megabytes
+            ));
+        } else {
+            self.multi_drag.prerender_bar = None;
+        }
         p.rect_filled(
             Rect::from_min_max(
                 pos2(full.left(), ruler.top()),
@@ -1207,14 +1586,11 @@ impl App {
             0.0,
             theme::ruler(),
         );
-        // header toolbar over the track headers: what the headers show, then the global toggles
+        // the corner left of the ruler: the Multitrack Tools pinned there as their own top
+        // layer, so tracks growing and scrolling underneath can never cover the buttons or
+        // take their clicks. The ruler's time-format selector lives in the Selection/View
+        // panel.
         {
-            let bar = Rect::from_min_max(
-                pos2(full.left() + 4.0, nav.top() + 2.0),
-                pos2(full.left() + header_w - 2.0, ruler.bottom() - 2.0),
-            );
-            // the bar has its own solid panel (nothing behind it shows through), with a divider
-            // to the timeline and a line under it, like the track headers below
             let panel = Rect::from_min_max(
                 pos2(full.left(), nav.top()),
                 pos2(full.left() + header_w, ruler.bottom()),
@@ -1229,57 +1605,8 @@ impl App {
                 [panel.left_bottom(), panel.right_bottom()],
                 Stroke::new(1.0, crate::theme::gray(18)),
             );
-            let mut bui = ui.new_child(
-                egui::UiBuilder::new()
-                    .max_rect(bar)
-                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
-            );
-            bui.spacing_mut().item_spacing.x = 1.0;
-            for (m, g, tip) in [
-                (0u8, HeadGlyph::Io, "Inputs/Outputs"),
-                (1, HeadGlyph::Fx, "Effects"),
-                (2, HeadGlyph::Sends, "Sends"),
-                (3, HeadGlyph::Eq, "EQ"),
-            ] {
-                if head_tool(&mut bui, g, self.header_view == m, tip).clicked() {
-                    self.header_view = m;
-                }
-            }
-            bui.add_space(8.0);
-            let metro_on = self
-                .session
-                .as_ref()
-                .map(|s| s.metronome.on)
-                .unwrap_or(false);
-            if head_tool(&mut bui, HeadGlyph::Metronome, metro_on, "Toggle Metronome").clicked() {
-                if let Some(s) = self.session.as_mut() {
-                    s.metronome.on = !metro_on;
-                    s.touch();
-                }
-            }
-            if head_tool(
-                &mut bui,
-                HeadGlyph::Stretch,
-                self.stretch_mode,
-                "Toggle Global Clip Stretching",
-            )
-            .clicked()
-            {
-                self.stretch_mode = !self.stretch_mode;
-            }
-            if head_tool(&mut bui, HeadGlyph::Snap, self.snapping, "Toggle Snapping").clicked() {
-                self.snapping = !self.snapping;
-            }
-            if head_tool(
-                &mut bui,
-                HeadGlyph::AutoScroll,
-                self.auto_scroll,
-                "Toggle Playback Auto-Scroll",
-            )
-            .clicked()
-            {
-                self.auto_scroll = !self.auto_scroll;
-            }
+            self.multi_drag.tool_panel = Some(panel);
+            self.multitrack_tools_corner(ui, panel);
         }
         // metronome row
         if metro_h > 0.0 {
@@ -1461,6 +1788,13 @@ impl App {
 
         // ---------- track headers & lanes
         let n_tracks = self.session.as_ref().unwrap().tracks.len();
+        // empty spans picked with Shift+click (the whole row) or Ctrl+click (the one span);
+        // kept by track id, so rows added or reordered around them do not move them
+        let sel_gaps: Vec<crate::session::GapSel> = self
+            .session
+            .as_ref()
+            .map(|s| s.selected_gaps.clone())
+            .unwrap_or_default();
         let total_h: f32 = self
             .session
             .as_ref()
@@ -1556,6 +1890,34 @@ impl App {
                 ],
                 Stroke::new(1.0, crate::theme::gray(12)),
             );
+            // the row's selected empty spans, shaded like the time selection with a soft
+            // edge (Shift+click took every span of the row, Ctrl+click the one clicked)
+            {
+                let area = clip_rects[ti];
+                let trk = self.session.as_ref().unwrap().tracks[ti].id;
+                for g in sel_gaps.iter().filter(|g| g.trk == trk) {
+                    let ga = x_of(g.a).max(lanes.left());
+                    let gb = x_of(g.b).min(lanes.right());
+                    if gb <= ga {
+                        continue;
+                    }
+                    let gr = Rect::from_min_max(
+                        pos2(ga, area.top() + 2.0),
+                        pos2(gb, area.bottom() - 2.0),
+                    )
+                    .intersect(tracks_rect);
+                    if !gr.is_positive() {
+                        continue;
+                    }
+                    clip_painter.rect_filled(gr, 0.0, crate::theme::gray_a(255, 26));
+                    clip_painter.rect_stroke(
+                        gr,
+                        0.0,
+                        Stroke::new(1.0, crate::theme::gray_a(255, 80)),
+                        egui::StrokeKind::Inside,
+                    );
+                }
+            }
             let color = self.session.as_ref().unwrap().tracks[ti].color;
             let strip = Rect::from_min_size(head.min, vec2(COLOR_STRIP_W, row.height()));
             // The track keeps its own colour when selected: selection is already shown by the
@@ -2354,6 +2716,12 @@ impl App {
         let show_env = self.show_env;
         let show_pan = self.show_pan_env;
         let selected_clip = self.session.as_ref().unwrap().selected_clip;
+        // the whole picked set is highlighted, not just the clip picked last
+        let sel_clips: Vec<u64> = self
+            .session
+            .as_ref()
+            .map(|s| s.selected_clips.clone())
+            .unwrap_or_default();
         // the fades actually heard (auto crossfades included), by clip id
         let eff: std::collections::HashMap<u64, (f64, f64, bool, bool)> = self
             .session
@@ -2399,7 +2767,7 @@ impl App {
                         continue;
                     }
                     let cp = clip_painter.with_clip_rect(vis);
-                    let sel = selected_clip == Some(c.id);
+                    let sel = selected_clip == Some(c.id) || sel_clips.contains(&c.id);
                     // A selected clip keeps its track colour, only lighter.
                     let lighter = |c: Color32, k: f32| {
                         Color32::from_rgb(
@@ -3097,6 +3465,14 @@ impl App {
                     (aresp.interact_pointer_pos(), self.multi_drag.drag)
                 {
                     if track == *ti {
+                        // Shift locks the point to the main 8 directions, like clips and keyframes
+                        let pp = if ui.input(|i| i.modifiers.shift) {
+                            ui.input(|i| i.pointer.press_origin())
+                                .map(|o| crate::keys::snap_dir8(o, pp))
+                                .unwrap_or(pp)
+                        } else {
+                            pp
+                        };
                         if let Some(s) = self.session.as_mut() {
                             if let Some((e, _)) = crate::keys::env_mut(s, target) {
                                 crate::workflows::move_auto_point(
@@ -3280,32 +3656,28 @@ impl App {
             };
             ui.ctx().set_cursor_icon(icon);
         }
-        let snap_px = 7.0;
-        let snap_points: Vec<f64> = {
-            let s = self.session.as_ref().unwrap();
-            let mut v = vec![0.0, cursor];
-            for t in &s.tracks {
-                for c in &t.clips {
-                    v.push(c.start);
-                    v.push(c.end());
-                }
-            }
-            v
-        };
+        let snap_px = self.prefs.snapping_distance();
+        let snap_prefs = self.prefs.clone();
         let snapping = self.snapping;
+        // the targets as the drag began this frame (the cursor and view may change below)
+        let (snap_cursor, snap_view) = (cursor, view);
+        // the dragged clip's own edges are left out by clip (not by position), so an edge that
+        // has landed on another clip's edge, on any track, stays snapped to it
         let snap = |s: &crate::session::Session, t: f64, exclude: Option<u64>, len: f64| -> f64 {
             if !snapping {
                 return t;
             }
             let mut best = t;
             let mut bd = snap_px as f64 / lanes.width() as f64 * span;
-            let mut pts = snap_points.clone();
-            if let Some(id) = exclude {
-                if let Some((ti, ci)) = s.find_clip(id) {
-                    let c = &s.tracks[ti].clips[ci];
-                    pts.retain(|p| (*p - c.start).abs() > 1e-9 && (*p - c.end()).abs() > 1e-9);
-                }
-            }
+            let pts = collect_snap_targets_except(
+                s,
+                &snap_prefs,
+                snap_cursor,
+                snap_view.1 - snap_view.0,
+                lanes.width(),
+                snap_view,
+                exclude,
+            );
             for p in pts {
                 for (cand, off) in [(p, 0.0), (p - len, len)] {
                     let _ = off;
@@ -3465,7 +3837,14 @@ impl App {
                     }
                     _ => MDrag::TimeSel { anchor: t },
                 };
-                // Alt+drag moves a copy of the clip and leaves the original in place
+                // several picked clips drag as one unit: record who moves with the clip
+                // in hand, and where each of them sits now
+                if let MDrag::Move { id, .. } = self.multi_drag.drag {
+                    if self.multi_drag.crew.is_empty() {
+                        self.multi_drag.crew = s.drag_crew(id);
+                    }
+                }
+                // Alt+drag moves a copy of the whole unit and leaves the originals in place
                 if let (
                     MDrag::Move {
                         id,
@@ -3476,13 +3855,30 @@ impl App {
                     true,
                 ) = (self.multi_drag.drag, ui.input(|i| i.modifiers.alt))
                 {
-                    if let Some((ti, ci)) = s.find_clip(id) {
-                        let nid = s.id();
-                        let mut c = s.tracks[ti].clips[ci].clone();
-                        c.id = nid;
-                        s.tracks[ti].clips.push(c);
+                    let crew = self.multi_drag.crew.clone();
+                    let mut copies: Vec<(u64, f64, usize)> = vec![];
+                    let mut new_ids: Vec<u64> = vec![];
+                    let mut grabbed: Option<u64> = None;
+                    for (cid, cst, _ctrk) in crew {
+                        if let Some((a, b)) = s.find_clip(cid) {
+                            let nid = s.id();
+                            let mut c = s.tracks[a].clips[b].clone();
+                            c.id = nid;
+                            s.tracks[a].clips.push(c);
+                            copies.push((nid, cst, a));
+                            new_ids.push(nid);
+                            if cid == id {
+                                grabbed = Some(nid);
+                            }
+                        }
+                    }
+                    if let Some(nid) = grabbed {
+                        // the copies become the selection; the originals stay put
+                        s.selected_clips = new_ids;
+                        s.selected_clip = Some(nid);
                         s.touch();
                         self.multi_drag.changed = true;
+                        self.multi_drag.crew = copies;
                         self.multi_drag.drag = MDrag::Move {
                             id: nid,
                             grab,
@@ -3492,8 +3888,18 @@ impl App {
                     }
                 }
                 match self.multi_drag.drag {
-                    MDrag::Move { id, .. }
-                    | MDrag::TrimL { id }
+                    MDrag::Move { id, .. } => {
+                        s.selected_clip = Some(id);
+                        // a multi-selection keeps its picked clips through the drag (the
+                        // crew already carries the grabbed clip's group with it); a clip
+                        // grabbed outside the selection picks up its group as before
+                        if !s.selected_clips.contains(&id) || s.selected_clips.len() == 1 {
+                            s.select_group_of(id);
+                        }
+                        // a clip picked last is what Delete removes, not a keyframe picked before
+                        self.multi_drag.key_sel.clear();
+                    }
+                    MDrag::TrimL { id }
                     | MDrag::TrimR { id }
                     | MDrag::FadeIn { id }
                     | MDrag::FadeOut { id }
@@ -3516,12 +3922,41 @@ impl App {
         }
         if resp.dragged() && !middle {
             if let Some(pp) = resp.interact_pointer_pos() {
+                let drag = self.multi_drag.drag;
+                // Shift locks the drag to the main 8 directions: a clip, keyframe or handle
+                // grabbed with Shift moves along one straight line only, so a mostly-upward
+                // drag moves straight up and a mostly-rightward one straight right
+                let pp = if ui.input(|i| i.modifiers.shift) && drag.is_object_drag() {
+                    ui.input(|i| i.pointer.press_origin())
+                        .map(|o| crate::keys::snap_dir8(o, pp))
+                        .unwrap_or(pp)
+                } else {
+                    pp
+                };
                 let t = on_grid(t_of(pp.x).max(0.0));
                 let track_at = lane_rects
                     .iter()
                     .position(|r| pp.y >= r.top() && pp.y < r.bottom());
-                let drag = self.multi_drag.drag;
                 let mut snapped: Option<f64> = None;
+                // a trimmed or stretched clip edge snaps like a moved clip: to the other clips'
+                // starts and ends on every track (above and below too), markers, the playhead...
+                let t = match drag {
+                    MDrag::TrimL { id }
+                    | MDrag::TrimR { id }
+                    | MDrag::StretchL { id, .. }
+                    | MDrag::StretchR { id, .. } => {
+                        let vel = ui.input(|i| i.pointer.velocity());
+                        let fast = vel.length() > self.prefs.snapping_distance() * 60.0;
+                        let sn = if fast || !snapping {
+                            t
+                        } else {
+                            on_grid(snap(self.session.as_ref().unwrap(), t, Some(id), 0.0))
+                        };
+                        self.multi_drag.edge_snap = ((sn - t).abs() > 1e-12).then_some(sn);
+                        sn
+                    }
+                    _ => t,
+                };
                 if let MDrag::Move { id, grab, .. } = drag {
                     let len = self
                         .session
@@ -3531,8 +3966,19 @@ impl App {
                         .map(|(a, b)| self.session.as_ref().unwrap().tracks[a].clips[b].len)
                         .unwrap_or(0.0);
                     let raw = (t - grab).max(0.0);
-                    let sn = snap(self.session.as_ref().unwrap(), raw, Some(id), len);
-                    snapped = Some(on_grid(if (sn - raw).abs() > 1e-12 { sn } else { raw }));
+                    // Sticky snapping, with the mouse's help: a drag holds the snap target it
+                    // landed on until it travels past the snapping distance (so an inch of drag
+                    // does not unsnap it), and a fast mouse is not pulled to a snap it cannot
+                    // stop for (the drag only follows the pointer when it is still moving gently).
+                    let vel = ui.input(|i| i.pointer.velocity());
+                    let fast = vel.length() > self.prefs.snapping_distance() * 60.0;
+                    let moved = if fast || !snapping {
+                        on_grid(raw)
+                    } else {
+                        let sn = snap(self.session.as_ref().unwrap(), raw, Some(id), len);
+                        on_grid(if (sn - raw).abs() > 1e-12 { sn } else { raw })
+                    };
+                    snapped = Some(moved);
                 }
                 // dragged below the last track: the clip gets a new track of its own
                 let below_last = track_at.is_none()
@@ -3546,31 +3992,54 @@ impl App {
                     MDrag::Move { id, .. } => {
                         let mut new_start = snapped.unwrap_or(0.0);
                         if let Some((ti, ci)) = s.find_clip(id) {
-                            // a group moves together and none of it goes before the start
-                            let old_start = s.tracks[ti].clips[ci].start;
-                            let earliest = s
-                                .group_of(id)
-                                .iter()
-                                .filter_map(|c| s.find_clip(*c))
-                                .map(|(a, b)| s.tracks[a].clips[b].start)
-                                .fold(old_start, f64::min);
-                            new_start = new_start.max(old_start - earliest);
-                            s.shift_group(id, new_start - old_start);
-                            let mut c = s.tracks[ti].clips[ci].clone();
-                            c.start = new_start;
+                            // the whole crew — every picked clip plus the grabbed clip's
+                            // group — moves as one rigid unit
+                            let mut crew = self.multi_drag.crew.clone();
+                            if !crew.iter().any(|(c, _, _)| *c == id) {
+                                // a drag without a crew (the session changed under it)
+                                // still moves the clip in hand on its own
+                                crew.push((id, s.tracks[ti].clips[ci].start, ti));
+                            }
+                            let (orig0, otrk0) = match crew.iter().find(|(c, _, _)| *c == id) {
+                                Some((_, st, tr)) => (*st, *tr),
+                                None => (s.tracks[ti].clips[ci].start, ti),
+                            };
+                            // none of the unit may go before the start of the timeline
+                            let earliest = crew.iter().map(|(_, st, _)| *st).fold(orig0, f64::min);
+                            new_start = new_start.max(orig0 - earliest);
+                            let delta = new_start - orig0;
+                            // one row for the clip in hand: the row under the pointer, a
+                            // new track below the last one, or its own when the pointer
+                            // left the tracks
                             let target = if below_last {
                                 let stereo = s.tracks[ti].stereo;
                                 Some(s.add_track(stereo))
                             } else {
                                 track_at
                             };
-                            match target {
-                                Some(nt) if nt != ti && nt < s.tracks.len() => {
-                                    s.tracks[ti].clips.remove(ci);
-                                    s.tracks[nt].clips.push(c);
-                                    s.selected_track = nt;
+                            let dtrack = target.map(|nt| nt as i64 - otrk0 as i64).unwrap_or(0);
+                            let rows = s.tracks.len() as i64;
+                            for (cid, ost, otrk) in crew {
+                                let Some((ct, cc)) = s.find_clip(cid) else {
+                                    continue;
+                                };
+                                s.tracks[ct].clips[cc].start = (ost + delta).max(0.0);
+                                // the unit keeps its shape across the rows too
+                                let mut row = otrk as i64 + dtrack;
+                                if row < 0 {
+                                    row = 0;
                                 }
-                                _ => s.tracks[ti].clips[ci].start = new_start,
+                                if row > rows - 1 {
+                                    row = rows - 1;
+                                }
+                                let row = row as usize;
+                                if row != ct {
+                                    let c = s.tracks[ct].clips.remove(cc);
+                                    s.tracks[row].clips.push(c);
+                                    if cid == id {
+                                        s.selected_track = row;
+                                    }
+                                }
                             }
                             s.touch();
                             self.multi_drag.changed = true;
@@ -3780,7 +4249,11 @@ impl App {
         }
         if resp.drag_stopped() {
             let label = match self.multi_drag.drag {
-                MDrag::Move { .. } => Some("Move Clip"),
+                MDrag::Move { .. } => Some(if self.multi_drag.crew.len() > 1 {
+                    "Move Clips"
+                } else {
+                    "Move Clip"
+                }),
                 MDrag::StretchL { .. } | MDrag::StretchR { .. } => Some("Stretch Clip"),
                 MDrag::TrimL { .. } | MDrag::TrimR { .. } => Some("Trim Clip"),
                 MDrag::FadeIn { .. } | MDrag::FadeOut { .. } => Some("Clip Fade"),
@@ -3795,6 +4268,7 @@ impl App {
                 hist = Some(l);
             }
             self.multi_drag.changed = false;
+            self.multi_drag.crew.clear();
             self.multi_drag.drag = MDrag::None;
         }
         if resp.clicked() {
@@ -3813,6 +4287,10 @@ impl App {
                 } else {
                     None
                 };
+                // Shift and Ctrl pick a selection where the black mouse tool grabs: anywhere
+                // with the Move tool, and on a clip's top bar with any tool (the one grab zone
+                // every tool shares). Elsewhere the tool keeps its own click.
+                let grab = self.tool == Tool::Move || matches!(h, Hit::Header(_));
                 match (h, self.tool) {
                     (_, Tool::Razor) if razor_hit.is_some() || shift => {
                         let t = on_grid(t);
@@ -3833,7 +4311,7 @@ impl App {
                         hist = Some("Split");
                     }
                     (Hit::StretchL(id) | Hit::StretchR(id) | Hit::Gain(id), _) => {
-                        s.select_clips(id, shift, ctrl);
+                        pick_clip(s, id, grab, shift, ctrl);
                         self.multi_drag.key_sel.clear();
                     }
                     (Hit::FadeLine(id, out), _) => {
@@ -3850,15 +4328,29 @@ impl App {
                             hist = Some("Add Fade Point");
                             s.clear_selected_clips();
                         } else {
-                            s.select_clips(id, shift, ctrl);
+                            pick_clip(s, id, grab, shift, ctrl);
                             self.multi_drag.key_sel.clear();
                         }
                     }
                     (Hit::None, _) => {
-                        s.clear_selected_clips();
-                        selection = None;
-                        cursor = t;
-                        self.multi_drag.key_sel.clear();
+                        // Shift picks every empty span of the row — or drops the span
+                        // clicked when it is already picked — and Ctrl toggles the span
+                        // clicked; both with the black mouse tool only
+                        if self.tool == Tool::Move && (shift || ctrl) {
+                            if let Some(tk) = track {
+                                if shift {
+                                    s.select_row_gaps(tk, t);
+                                } else {
+                                    s.toggle_gap(tk, t);
+                                }
+                                self.multi_drag.key_sel.clear();
+                            }
+                        } else {
+                            s.clear_selected_clips();
+                            selection = None;
+                            cursor = t;
+                            self.multi_drag.key_sel.clear();
+                        }
                     }
                     (Hit::EnvLine(id), _) => {
                         let body = hits.iter().find(|h| h.1 == id).map(|h| {
@@ -3904,7 +4396,7 @@ impl App {
                         | Hit::FadeOut(id),
                         _,
                     ) => {
-                        s.select_clips(id, shift, ctrl);
+                        pick_clip(s, id, grab, shift, ctrl);
                         // the clip clicked last is what Delete removes, not a keyframe from before
                         self.multi_drag.key_sel.clear();
                         if self.tool == Tool::TimeSel {
@@ -3945,12 +4437,24 @@ impl App {
                 if !snapping {
                     return (t, false);
                 }
-                let mut targets = vec![0.0, cursor];
+                let p = &self.prefs;
+                let mut targets = vec![];
+                if p.snap_session_start {
+                    targets.push(0.0);
+                }
+                if p.snap_playhead {
+                    targets.push(cursor);
+                }
                 if let Some(tr) = s.tracks.get(tk) {
                     for c in &tr.clips {
-                        targets.push(c.start);
-                        targets.push(c.end());
-                        targets.push(c.start - len);
+                        if p.snap_clip_starts {
+                            targets.push(c.start);
+                        }
+                        if p.snap_clip_ends {
+                            // so the dropped clip's end can land on an existing clip's start
+                            targets.push(c.end());
+                            targets.push(c.start - len);
+                        }
                     }
                 }
                 let px = |a: f64| ((a - t) / span) as f32 * lanes.width();
@@ -4482,6 +4986,14 @@ impl App {
                         (aresp.interact_pointer_pos(), self.multi_drag.drag)
                     {
                         if track == usize::MAX {
+                            // Shift locks the point to the main 8 directions, like clips and keyframes
+                            let pp = if ui.input(|i| i.modifiers.shift) {
+                                ui.input(|i| i.pointer.press_origin())
+                                    .map(|o| crate::keys::snap_dir8(o, pp))
+                                    .unwrap_or(pp)
+                            } else {
+                                pp
+                            };
                             if let Some(s) = self.session.as_mut() {
                                 crate::workflows::move_auto_point(
                                     &mut s.master.vol_env,
@@ -4552,6 +5064,46 @@ impl App {
                 theme::playhead(),
                 Stroke::NONE,
             ));
+        }
+        // the snapping point: like the playhead line but brighter and in the theme's
+        // negative colour, so it is obvious where a dragged edge is about to snap
+        if self.snapping && resp.dragged() {
+            let snap_x = match self.multi_drag.drag {
+                MDrag::Move { id, grab, .. } => {
+                    if let Some(pp) = resp.interact_pointer_pos() {
+                        let len = self
+                            .session
+                            .as_ref()
+                            .and_then(|s| s.find_clip(id).map(|(a, b)| s.tracks[a].clips[b].len))
+                            .unwrap_or(0.0);
+                        let raw = (on_grid(t_of(pp.x).max(0.0)) - grab).max(0.0);
+                        let vel = ui.input(|i| i.pointer.velocity());
+                        let fast = vel.length() > self.prefs.snapping_distance() * 60.0;
+                        let moved = if fast || !snapping {
+                            on_grid(raw)
+                        } else {
+                            let sn = snap(self.session.as_ref().unwrap(), raw, Some(id), len);
+                            on_grid(if (sn - raw).abs() > 1e-12 { sn } else { raw })
+                        };
+                        Some(x_of(moved))
+                    } else {
+                        None
+                    }
+                }
+                MDrag::TrimL { .. }
+                | MDrag::TrimR { .. }
+                | MDrag::StretchL { .. }
+                | MDrag::StretchR { .. } => self.multi_drag.edge_snap.map(x_of),
+                _ => None,
+            };
+            if let Some(x) = snap_x {
+                if x >= lanes.left() && x <= lanes.right() {
+                    p.line_segment(
+                        [pos2(x, ruler.top()), pos2(x, tracks_rect.bottom())],
+                        Stroke::new(2.0, theme::snap_line()),
+                    );
+                }
+            }
         }
         // vertical navigator: a miniature of the tracks with the visible window; drag the window to
         // scroll, stretch its top/bottom grips (or use the wheel over it) to make the tracks taller

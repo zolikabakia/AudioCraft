@@ -17,14 +17,38 @@ documented command, MIT licensed. It was built clean-room from public knowledge 
   varispeed, tone and noise generators, and favorites.
 - **Multitrack:** tracks with volume, pan, mute, solo, record arm, a live effects rack and a level
   meter; clips that can be moved, trimmed, slipped, split (razor), faded and given volume envelopes;
+  with the **Move tool** (the black mouse) Shift+click on a clip selects every clip in its row and
+  Ctrl+click toggles the one clip; on empty lane space Shift+click selects every empty span of the
+  row and Ctrl+click toggles the span clicked; over a clip's top bar these clicks work with every
+  tool (the one grab zone they all share). The whole selection is highlighted, not just the clip
+  picked last. Holding Shift while dragging locks the move to the main 8 directions (a mostly-upward
+  drag moves the clip straight up, a mostly-rightward one straight along its track);
   track and Master **automation lanes**: the chevron beside each Read selector opens a lane *under*
   the track (the track grows), with Show Envelopes (Volume, Pan), Select (which one is edited), and
   protect / clear / previous / add / next keyframe tools; drag the lane's lower border to resize it;
-  snapping; a mixer view; session save/load (`.acsession`); mixdown to a file or to a new file.
+  snapping (its magnet is in the Multitrack Tools corner, together with the other
+  modifiers; the small arrow beside the magnet opens a regular drop-down menu of targets: clip
+  starts and ends, markers, the ruler's time marks, the playhead and the session start; moved clips and trimmed or
+  stretched clip edges snap to the other clips' starts and ends on their own track and on the
+  tracks above and below, and stay snapped while the drag rests there); the time
+  display format (decimal, samples, seconds, SMPTE, CD) is picked at the top of the Selection/View
+  panel (the bottom row can't be dragged smaller than that panel needs); a **pre-render gauge**
+  along the ruler's top edge, in the theme's colours, whenever a track has Pre-render on (the
+  lightning button in Track Effects): filled where the tracks already play from rendered audio,
+  faded over the stretch still being rendered (renders run a little every frame; outside the
+  rendered stretch a track plays its effects live; hover for the percentage and cache use).
+  Pre-render is dynamic (Preferences > Multitrack > Pre-render): pre-rendered tracks share a
+  cache cap in MB; when a track's whole render fits its share the whole session is filled,
+  otherwise the render follows the playhead, a set number of seconds ahead and behind, dropping
+  what falls behind and starting over where the playhead jumps. Each render carries on past
+  the track's last clip until its effects have died away (a reverb or delay tail), up to the
+  "longest effect tail" setting; a mixer view; session save/load (`.acsession`);
+  mixdown to a file or to a new file.
 - **Keyframes:** every envelope's keyframes (clip volume and pan, track and Master lanes, fade
   points) are small squares that light up under the pointer, select on click (Shift/Ctrl adds) in
-  the selection colour, drag (together when several are selected) and go away with Delete or a
-  double-click. Click a line to add one. The **Direct Selection tool** (white arrow, `A`) shows the
+  the selection colour, drag (together when several are selected; Shift locks the move to the main
+  8 directions) and go away with Delete or a double-click. Click a line to add one. The **Direct
+  Selection tool** (white arrow, `A`) shows the
   curve handles: drag a handle to bend the curve (its partner turns with it), Alt+drag a handle to
   move it alone, Alt+drag a keyframe to pull out new symmetric handles, Alt+click a keyframe to give
   it handles or take them away. Sizes and the selection colour are in Preferences > Multitrack.

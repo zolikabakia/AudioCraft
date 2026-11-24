@@ -69,7 +69,11 @@ fn draw_empty_rack(ui: &mut egui::Ui) {
     // Drawn with exactly the live rack's sizes and shapes (row height, rounded number and power
     // boxes, the large painted arrow, the same scroll bar and bottom buttons), only greyed out,
     // so the panel never changes look when the first file or track arrives.
-    ui.label(RichText::new("Track: Track 1").strong().color(theme::text_dim()));
+    ui.label(
+        RichText::new("Track: Track 1")
+            .strong()
+            .color(theme::text_dim()),
+    );
     let below = 132.0 + 40.0;
     let rows_h = (ui.available_height() - below).clamp(3.0 * RACK_ROW_H, 16.0 * RACK_ROW_H + 2.0);
     egui::ScrollArea::vertical()
@@ -92,7 +96,8 @@ fn draw_empty_rack(ui: &mut egui::Ui) {
                     },
                 );
                 p.rect_filled(
-                    egui::Rect::from_min_size(r.min, vec2(20.0, r.height())).shrink2(vec2(0.0, 1.0)),
+                    egui::Rect::from_min_size(r.min, vec2(20.0, r.height()))
+                        .shrink2(vec2(0.0, 1.0)),
                     crate::theme::ROUND as f32 - 2.0,
                     theme::own_or(crate::theme::gray(40), theme::control()),
                 );
@@ -105,7 +110,10 @@ fn draw_empty_rack(ui: &mut egui::Ui) {
                 );
                 let mut row = ui.new_child(
                     egui::UiBuilder::new()
-                        .max_rect(egui::Rect::from_min_max(pos2(r.left() + 22.0, r.top()), r.max))
+                        .max_rect(egui::Rect::from_min_max(
+                            pos2(r.left() + 22.0, r.top()),
+                            r.max,
+                        ))
                         .layout(egui::Layout::left_to_right(egui::Align::Center)),
                 );
                 row.add_enabled_ui(false, |row| {
@@ -173,7 +181,12 @@ fn draw_empty_rack(ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 3.0;
             power_switch(ui, true, "Open a file or add a track to use the rack");
-            tool_toggle(ui, Icon::List, true, "Show or hide the Input, Output and Mix controls");
+            tool_toggle(
+                ui,
+                Icon::List,
+                true,
+                "Show or hide the Input, Output and Mix controls",
+            );
             tool_toggle(ui, Icon::PostFader, true, "Pre- or post-fader");
             tool_toggle(ui, Icon::Lightning, false, "Pre-render the track's effects");
         });
@@ -1146,7 +1159,11 @@ impl App {
                 let g = ghost.layout_no_wrap(name, egui::FontId::proportional(12.5), theme::text());
                 let gr =
                     egui::Rect::from_min_size(pp + vec2(14.0, -10.0), g.size() + vec2(16.0, 6.0));
-                ghost.rect_filled(gr, crate::theme::ROUND as f32, crate::theme::gray_a(60, 230));
+                ghost.rect_filled(
+                    gr,
+                    crate::theme::ROUND as f32,
+                    crate::theme::gray_a(60, 230),
+                );
                 ghost.rect_stroke(
                     gr,
                     crate::theme::ROUND as f32,

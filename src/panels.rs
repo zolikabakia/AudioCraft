@@ -1459,6 +1459,8 @@ impl App {
 
     pub fn selection_view(&mut self, ui: &mut egui::Ui) {
         theme::title_header(ui, "Selection/View");
+        // the panel's fixed height holds three rows and the format dropdown: compact controls
+        ui.spacing_mut().interact_size.y = 16.0;
         let fmt = self.time_format;
         let rate = self.rate();
         let (mut sel, mut view) = match self.mode {
@@ -1475,17 +1477,46 @@ impl App {
         let (osel, oview) = (sel, view);
         let mut sel_dur = sel.1 - sel.0;
         let mut view_dur = view.1 - view.0;
+        // the time-format selector for every time readout, at the top of the panel above the
+        // Selection/View rows, so shrinking the panel never hides it (View > Time Display has
+        // the same list)
+        let idx = TimeFormat::ALL
+            .iter()
+            .position(|(f, _)| *f == fmt)
+            .unwrap_or(0);
         egui::Frame::new()
-            .inner_margin(egui::Margin::symmetric(10, 4))
+            .inner_margin(egui::Margin {
+                left: 10,
+                right: 6,
+                top: 3,
+                bottom: 1,
+            })
+            .show(ui, |ui| {
+                egui::ComboBox::from_id_salt("sv_time_format")
+                    .width((ui.available_width() - 2.0).max(120.0))
+                    .selected_text(TimeFormat::ALL[idx].1)
+                    .show_ui(ui, |ui| {
+                        for (i, (f, name)) in TimeFormat::ALL.iter().enumerate() {
+                            if ui
+                                .selectable_label(self.time_format == *f, *name)
+                                .clicked()
+                            {
+                                self.set_time_format(i);
+                            }
+                        }
+                    });
+            });
+        egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(10, 2))
             .show(ui, |ui| {
                 egui::Grid::new("selview")
                     .num_columns(4)
-                    .spacing([14.0, 4.0])
+                    .spacing([14.0, 1.0])
                     .show(ui, |ui| {
                         ui.label("");
-                        ui.label(RichText::new("Start").color(theme::text_dim()));
-                        ui.label(RichText::new("End").color(theme::text_dim()));
-                        ui.label(RichText::new("Duration").color(theme::text_dim()));
+                        ui.label(RichText::new("Start").small().color(theme::text_dim()));
+                        ui.label(RichText::new("End").small().color(theme::text_dim()));
+                        ui.label(RichText::new("Duration").small().color(theme::text_dim()));
                         ui.end_row();
                         ui.label("Selection");
                         time_drag(ui, &mut sel.0, fmt, rate, enabled);

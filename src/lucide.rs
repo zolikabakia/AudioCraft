@@ -75,6 +75,8 @@ def!(
 );
 // own: follow the playhead
 def!(AUTOSCROLL, ["M4 4v16", "M8 12h12", "m16 8 4 4-4 4"]);
+// Lucide: chevron-down (the snapping-targets unfold)
+def!(CHEVRON_DOWN, ["m6 9 6 6 6-6"]);
 // Lucide: folder-open
 def!(
     FOLDER_OPEN,

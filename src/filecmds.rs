@@ -133,7 +133,7 @@ pub const MORE_COMMANDS: &[Cmd] = more![
         "edit.ripple_delete_clips",
         "Ripple Delete: Selected Clips",
         "",
-        "Delete the selected clips and pull the later clips of their tracks left to close the gap."
+        "Delete the selected clips and pull the later clips of their tracks left to close the gap. Picked empty space closes the same way (this is also what Shift+Delete does)."
     ),
     (
         "edit.ripple_delete_time",
@@ -540,6 +540,81 @@ pub fn ripple_delete_clips(s: &mut crate::session::Session, ids: &[u64]) -> usiz
     if n > 0 {
         s.selected_clips.clear();
         s.selected_clip = None;
+        s.touch();
+    }
+    n
+}
+
+/// Delete these clips and leave the space they occupied (Delete / Backspace on picked
+/// clips; Shift+Delete closes the space instead: `ripple_delete_clips`). Returns how
+/// many went.
+pub fn delete_clips_plain(s: &mut crate::session::Session, ids: &[u64]) -> usize {
+    let mut n = 0;
+    for t in s.tracks.iter_mut() {
+        let before = t.clips.len();
+        t.clips.retain(|c| !ids.contains(&c.id));
+        n += before - t.clips.len();
+    }
+    if n > 0 {
+        s.clear_selected_clips();
+        s.touch();
+    }
+    n
+}
+
+/// Ripple delete these picked empty spans (Delete or Shift+Delete on selected empty
+/// space, the person's rule: empty space has no content, so closing it is what Delete
+/// does to it). The span's time is cut out of its own track — whatever ended up inside
+/// goes with it — and what follows pulls left; the open tail span has no end to pull to
+/// and does nothing. Returns how many spans closed.
+pub fn ripple_delete_gaps(
+    s: &mut crate::session::Session,
+    gaps: &[crate::session::GapSel],
+) -> usize {
+    // each track's picked spans, the rightmost first so the earlier cuts stay exact
+    let mut per: Vec<(usize, Vec<(f64, f64)>)> = vec![];
+    for g in gaps {
+        if !g.b.is_finite() || !(g.b > g.a) {
+            continue;
+        }
+        if let Some(ti) = s.tracks.iter().position(|t| t.id == g.trk) {
+            match per.iter_mut().find(|(t, _)| *t == ti) {
+                Some((_, v)) => v.push((g.a, g.b)),
+                None => per.push((ti, vec![(g.a, g.b)])),
+            }
+        }
+    }
+    let mut n = 0;
+    for (ti, mut spans) in per {
+        spans.sort_by(|x, y| y.0.total_cmp(&x.0));
+        for (a, b) in spans {
+            // cut a..b out of this one track the way Ripple Delete > Time Selection cuts
+            // every track: split at both edges, drop what is inside, pull the rest left
+            let ids: Vec<u64> = s.tracks[ti].clips.iter().map(|c| c.id).collect();
+            for id in ids {
+                if let Some(r) = s.split_clip(id, a) {
+                    s.split_clip(r, b);
+                } else {
+                    s.split_clip(id, b);
+                }
+            }
+            let eps = 1e-6;
+            let gap = b - a;
+            let t = &mut s.tracks[ti];
+            t.clips
+                .retain(|c| !(c.start >= a - eps && c.end() <= b + eps));
+            for c in t.clips.iter_mut() {
+                if c.start >= b - eps {
+                    c.start = (c.start - gap).max(0.0);
+                }
+            }
+            shift_track_automation(t, a, b);
+            n += 1;
+        }
+    }
+    if n > 0 {
+        s.selected_gaps.clear();
+        s.prune_selection();
         s.touch();
     }
     n
@@ -1016,17 +1091,23 @@ impl App {
                 let ids: Vec<u64> = t.clips.iter().map(|c| c.id).collect();
                 s.selected_clip = ids.first().copied();
                 s.selected_clips = ids;
+                s.selected_gaps.clear();
             }
             "edit.ripple_delete_clips" => {
                 let ids = self.selected_clip_ids();
-                if ids.is_empty() {
-                    return Err("Select the clips to delete first.".into());
-                }
-                let n = self
+                let gaps = self
                     .session
-                    .as_mut()
-                    .map(|s| ripple_delete_clips(s, &ids))
-                    .unwrap_or(0);
+                    .as_ref()
+                    .map(|s| s.selected_gaps.clone())
+                    .unwrap_or_default();
+                if ids.is_empty() && gaps.is_empty() {
+                    return Err("Select clips or empty space to delete first.".into());
+                }
+                let mut n = 0;
+                if let Some(s) = self.session.as_mut() {
+                    n += ripple_delete_gaps(s, &gaps);
+                    n += ripple_delete_clips(s, &ids);
+                }
                 if n > 0 {
                     self.session_push("Ripple Delete Clips");
                 }

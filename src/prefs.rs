@@ -92,8 +92,30 @@ pub struct Prefs {
     pub warn_sesx_compat: bool,
     pub sesx_bake_tolerance_db: f32,
     pub pre_render_tracks: bool,
+    /// Pre-render cache cap (MB) shared by every pre-rendered track. When a track's whole
+    /// render fits its share, the whole session is rendered; otherwise a window follows the
+    /// playhead.
+    pub prerender_cap_mb: f32,
+    /// Seconds a following pre-render keeps ready in front of the playhead.
+    pub prerender_ahead_s: f32,
+    /// Seconds a following pre-render keeps behind the playhead.
+    pub prerender_behind_s: f32,
+    /// The longest effect tail (reverb, delay) rendered after a track's last clip; the render
+    /// stops earlier as soon as the tail has died away.
+    pub prerender_max_tail_s: f32,
     /// Height of a track's Input and Output buttons (Preferences > Multitrack).
     pub track_io_button_height: f32,
+    /// Distance in screen pixels within which a drag with Snapping on lands on a snap target
+    /// (Preferences > Multitrack > Snapping distance).
+    pub snapping_distance_px: f32,
+    /// What a drag with Snapping on considers a target (the magnet menu in the Multitrack
+    /// Tools window, and Preferences > Multitrack). "Snap to markers" lives with the marker
+    /// settings and applies here too.
+    pub snap_time_display: bool,
+    pub snap_clip_starts: bool,
+    pub snap_clip_ends: bool,
+    pub snap_playhead: bool,
+    pub snap_session_start: bool,
     // Multitrack Clips
     pub auto_crossfade: bool,
     pub default_crossfade_curve: u8,
@@ -189,7 +211,17 @@ impl Default for Prefs {
             warn_sesx_compat: true,
             sesx_bake_tolerance_db: 0.25,
             pre_render_tracks: false,
+            prerender_cap_mb: 1024.0,
+            prerender_ahead_s: 30.0,
+            prerender_behind_s: 10.0,
+            prerender_max_tail_s: 30.0,
             track_io_button_height: 22.0,
+            snapping_distance_px: 7.0,
+            snap_time_display: true,
+            snap_clip_starts: true,
+            snap_clip_ends: true,
+            snap_playhead: true,
+            snap_session_start: true,
             auto_crossfade: true,
             default_crossfade_curve: 0,
             clip_fade_points_smooth: true,
@@ -315,6 +347,18 @@ pub fn track_height() -> f32 {
 /// Height of the Input and Output buttons in a fresh track's header.
 pub fn io_button_height() -> f32 {
     IO_BUTTON_PX.load(std::sync::atomic::Ordering::Relaxed) as f32 / 10.0
+}
+
+impl Prefs {
+    /// The snapping distance in screen pixels within which a drag with Snapping on lands on
+    /// a snap target (Preferences > Multitrack > Snapping distance).
+    pub fn snapping_distance(&self) -> f32 {
+        if self.snapping_distance_px.is_finite() {
+            self.snapping_distance_px.clamp(0.0, 100.0)
+        } else {
+            7.0
+        }
+    }
 }
 
 impl Prefs {

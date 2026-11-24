@@ -328,8 +328,16 @@ pub fn phase_curve_editor(
         });
     }
     if resp.dragged() {
-        if let (Some(i), Some(q)) = (drag, resp.interact_pointer_pos()) {
+        if let (Some(i), Some(q0)) = (drag, resp.interact_pointer_pos()) {
             if i < points.len() {
+                // Shift locks the point to the main 8 directions, like clips and keyframes
+                let q = if ui.input(|i| i.modifiers.shift) {
+                    ui.input(|i| i.pointer.press_origin())
+                        .map(|o| crate::keys::snap_dir8(o, q0))
+                        .unwrap_or(q0)
+                } else {
+                    q0
+                };
                 let last = points.len() - 1;
                 // the end points stay at the ends; the others move between their neighbours
                 let f = if i == 0 {
@@ -526,8 +534,16 @@ pub fn parametric(
         });
     }
     if resp.dragged() {
-        if let (Some(i), Some(q)) = (dragging, resp.interact_pointer_pos()) {
+        if let (Some(i), Some(q0)) = (dragging, resp.interact_pointer_pos()) {
             if let Some(b) = bands.get_mut(i) {
+                // Shift locks the band handle to the main 8 directions, like keyframes
+                let q = if ui.input(|i| i.modifiers.shift) {
+                    ui.input(|i| i.pointer.press_origin())
+                        .map(|o| crate::keys::snap_dir8(o, q0))
+                        .unwrap_or(q0)
+                } else {
+                    q0
+                };
                 b.freq = ax.f(q.x).clamp(10.0, rate * 0.49).round();
                 if b.kind.uses_gain() {
                     b.gain_db = (ax.d(q.y) * 10.0).round() / 10.0;

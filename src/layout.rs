@@ -326,6 +326,10 @@ impl eframe::App for App {
         self.help_window(&ctx);
         // panels in windows of their own (New Window, Undock Panel, dual monitor)
         self.float_windows(&ctx);
+        // pre-renders run a few milliseconds a frame (the gauge on the ruler fills as they go)
+        if self.prerender_tick(std::time::Duration::from_millis(8)) {
+            ctx.request_repaint();
+        }
         // last: docked plug-in editors follow the Plug-ins panel and step aside for menus
         self.plug_service(&ctx);
     }
@@ -367,6 +371,34 @@ impl App {
         }
         let mut cmd: Vec<&'static str> = vec![];
         ctx.input_mut(|i| {
+            if i.events.iter().any(|e| {
+                matches!(
+                    e,
+                    egui::Event::Key {
+                        key: egui::Key::Delete,
+                        pressed: true,
+                        ..
+                    }
+                )
+            }) {
+                eprintln!(
+                    "DEBUG delete-key events: {:?}",
+                    i.events
+                        .iter()
+                        .filter_map(|e| match e {
+                            egui::Event::Key {
+                                key,
+                                pressed,
+                                modifiers,
+                                ..
+                            } => {
+                                Some((key, *pressed, modifiers))
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                );
+            }
             let mut sc = |m: M, k: Key, c: &'static str| {
                 if i.consume_shortcut(&KS::new(m, k)) {
                     cmd.push(c);
@@ -418,6 +450,8 @@ impl App {
             sc(M::SHIFT, Key::Space, "record");
             sc(M::SHIFT, Key::D, "spectral");
             sc(M::SHIFT, Key::E, "essential");
+            sc(M::SHIFT, Key::Delete, "rippledelete");
+            sc(M::SHIFT, Key::Backspace, "rippledelete");
             sc(M::NONE, Key::Space, "play");
             sc(M::NONE, Key::Delete, "delete");
             sc(M::NONE, Key::Backspace, "backspace");
@@ -455,7 +489,9 @@ impl App {
             }
             return;
         }
-        if self.mode == Mode::Multitrack && matches!(c, "delete" | "backspace" | "cut" | "copy") {
+        if self.mode == Mode::Multitrack
+            && matches!(c, "delete" | "backspace" | "cut" | "copy" | "rippledelete")
+        {
             // settle clip-or-keyframe first, so the edit hits only what was picked last
             self.keys_take_selection();
         }
@@ -513,6 +549,27 @@ impl App {
             {
                 // selected keyframes go first (not the clip they are on)
                 self.delete_selected_keys();
+            }
+            // Shift+Delete / Shift+Backspace: ripple delete. Delete alone leaves the space
+            // the clips occupied; picked empty space closes up either way, because empty
+            // ground has no content — closing the gap is all Delete can do to it.
+            "rippledelete"
+                if self.mode == Mode::Multitrack && !self.multi_drag.key_sel.is_empty() =>
+            {
+                // keyframes have no gap to close: they go the usual way
+                self.delete_selected_keys();
+            }
+            "rippledelete" if self.mode == Mode::Multitrack => {
+                self.ripple_delete_selection();
+            }
+            "rippledelete" => {
+                // in the Waveform editor, deleting from one stream already closes the gap
+                if !(self.mode == Mode::Waveform
+                    && self
+                        .spectral_apply(crate::spectral::SpecOp::Gain(-200.0), "Delete (spectral)"))
+                {
+                    self.delete_selection("Delete")
+                }
             }
             "delete" | "backspace" => {
                 // with a spectral selection, Delete removes just those frequencies
@@ -1702,6 +1759,7 @@ impl App {
                 );
                 theme::check_toggle(ui, &mut self.auto_scroll, "Auto-scroll During Playback", "");
                 self.menu_cmd(ui, true, "Next Colour Theme", "view.theme_toggle", &ctx);
+                theme::check_toggle(ui, &mut self.show_tools_window, "Multitrack Tools", "");
                 theme::check_toggle(ui, &mut self.show_env, "Show Clip Volume Envelopes", "");
                 theme::check_toggle(ui, &mut self.show_pan_env, "Show Clip Pan Envelopes", "");
                 self.menu_cmd(

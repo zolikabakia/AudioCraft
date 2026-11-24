@@ -1932,6 +1932,20 @@ impl App {
             }
             if resp.dragged_by(egui::PointerButton::Primary) {
                 if let Some((t, f, _)) = resp.interact_pointer_pos().and_then(tf) {
+                    // Shift locks a grabbed selection (its edge, corner or middle) to the main
+                    // 8 directions: the whole drag from where it started is projected onto the
+                    // nearest 45° line, like clips, keyframes and handles elsewhere
+                    let shift_lock = ui.input(|i| i.modifiers.shift);
+                    let locked = |t: f64, f: f32| -> (f64, f32) {
+                        if !shift_lock {
+                            return (t, f);
+                        }
+                        origin
+                            .zip(resp.interact_pointer_pos())
+                            .and_then(|(o, pp)| tf(crate::keys::snap_dir8(o, pp)))
+                            .map(|(t2, f2, _)| (t2, f2))
+                            .unwrap_or((t, f))
+                    };
                     match (self.drag_state.spec_drag, &mut spec_sel) {
                         (
                             SpecDrag::Make { t: t0, f: f0 },
@@ -1956,6 +1970,7 @@ impl App {
                                 f1: hi,
                             }),
                         ) => {
+                            let (t, f) = locked(t, f);
                             if edges & 1 != 0 {
                                 *a = t.min(*b);
                             }
@@ -1970,6 +1985,7 @@ impl App {
                             }
                         }
                         (SpecDrag::Move { t: lt, f: lf }, Some(s)) => {
+                            let (t, f) = locked(t, f);
                             // the grabbed point stays under the pointer; at the top or bottom of
                             // the range the selection stops there instead of drifting off it
                             let f_now = if self.prefs.spec_move_keep_octaves {
@@ -2242,6 +2258,15 @@ impl App {
             }
             if active {
                 if let Some(pp) = ui.ctx().pointer_latest_pos() {
+                    // Shift locks the fade handle to the main 8 directions: mostly inward
+                    // changes only the length, mostly up/down only the curve
+                    let pp = if ui.input(|i| i.modifiers.shift) {
+                        ui.input(|i| i.pointer.press_origin())
+                            .map(|o| crate::keys::snap_dir8(o, pp))
+                            .unwrap_or(pp)
+                    } else {
+                        pp
+                    };
                     let t = t_of(pp.x).clamp(0.0, dur);
                     self.drag_state.fade_len = if is_in { t } else { dur - t };
                     let dy = pp.y - self.drag_state.fade_grab_y;

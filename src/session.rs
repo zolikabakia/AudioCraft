@@ -516,6 +516,19 @@ pub const TRACK_COLORS: [[u8; 3]; 8] = [
     [70, 170, 180],
 ];
 
+/// One selected empty span of a track's lane: from `a` to `b` seconds, where `b` is
+/// infinity for the open end after the last clip. Picked with Shift+click (every span of
+/// the row) or Ctrl+click (the one span clicked) on empty lane space. The span is
+/// remembered as it was when picked: moving clips afterwards does not move it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GapSel {
+    /// The track it belongs to, by id (not row number, so rows can be added or reordered
+    /// around it without the span jumping to another track).
+    pub trk: u64,
+    pub a: f64,
+    pub b: f64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Session {
     pub name: String,
@@ -552,10 +565,15 @@ pub struct Session {
     pub selected_track: usize,
     #[serde(skip)]
     pub selected_clip: Option<u64>,
-    /// Clips selected in the Multitrack area: a plain click selects one, Shift+click selects
-    /// the range between the last selected clip and the clicked clip, Ctrl+click toggles it.
+    /// Clips selected in the Multitrack area: a plain click selects one, Ctrl+click toggles
+    /// the clicked clip in the set (Shift+click takes the whole row: `select_row_clips`).
     #[serde(skip)]
     pub selected_clips: Vec<u64>,
+    /// Empty spans selected in the Multitrack area with Shift+click or Ctrl+click on
+    /// empty lane space: Shift takes every span of the clicked row, Ctrl toggles the one
+    /// clicked. Cleared together with the clips (a plain click resets both).
+    #[serde(skip)]
+    pub selected_gaps: Vec<GapSel>,
     #[serde(skip)]
     pub dirty: bool,
     /// Fingerprint of the content when it was last saved or opened: a change that is undone,
@@ -618,6 +636,7 @@ impl Session {
             selected_track: 0,
             selected_clip: None,
             selected_clips: vec![],
+            selected_gaps: vec![],
             dirty: false,
             saved_fp: None,
             revision: 1,
@@ -699,30 +718,22 @@ impl Session {
         self.dirty = true;
     }
 
-    /// Multitrack selection of clips: a plain click selects one; Shift+click selects the range
-    /// between the last selected clip and the clicked one; Ctrl+click toggles the clicked
-    /// clip in the set. The clicked clip is the active one (`selected_clip`).
-    pub fn select_clips(&mut self, id: u64, shift: bool, ctrl: bool) {
+    /// Multitrack selection of clips: a plain click selects one clip on its own, Ctrl+click
+    /// toggles the clicked clip in the set so several can be picked one by one (Shift+click
+    /// takes every clip of the row instead: `select_row_clips`). The clip picked last
+    /// becomes the active one (`selected_clip`), and dropping the active one hands that
+    /// role to another clip still in the set. A plain click also drops the selected empty
+    /// spans: the selection is then just this clip.
+    pub fn select_clips(&mut self, id: u64, toggle: bool) {
         let flat: Vec<u64> = self
             .tracks
             .iter()
             .flat_map(|t| t.clips.iter().map(|c| c.id))
             .collect();
-        let Some(pos) = flat.iter().position(|c| *c == id) else {
+        if !flat.contains(&id) {
             return;
-        };
-        if shift {
-            let anchor = self
-                .selected_clip
-                .and_then(|a| flat.iter().position(|c| *c == a));
-            match anchor {
-                Some(a) => {
-                    let (lo, hi) = (a.min(pos), a.max(pos));
-                    self.selected_clips = flat[lo..=hi].to_vec();
-                }
-                None => self.selected_clips = vec![id],
-            }
-        } else if ctrl {
+        }
+        if toggle {
             if self.selected_clips.contains(&id) {
                 self.selected_clips.retain(|c| *c != id);
             } else {
@@ -730,17 +741,166 @@ impl Session {
             }
         } else {
             self.selected_clips = vec![id];
+            self.selected_gaps.clear();
         }
+        let active_still = self
+            .selected_clip
+            .is_some_and(|a| self.selected_clips.contains(&a));
         self.selected_clip = if self.selected_clips.is_empty() {
             None
-        } else {
+        } else if self.selected_clips.contains(&id) {
             Some(id)
+        } else if active_still {
+            self.selected_clip
+        } else {
+            self.selected_clips.last().copied()
         };
+    }
+
+    /// Shift+click on a clip: when the clip is already picked, that one clip leaves the
+    /// selection (Shift+click un-picks what is already selected, the person's rule), else
+    /// every clip on that clip's track joins the selection (what is already picked stays
+    /// picked, so a second row can join the same selection) and the clip clicked becomes
+    /// the active one.
+    pub fn select_row_clips(&mut self, id: u64) {
+        let Some((tk, _)) = self.find_clip(id) else {
+            return;
+        };
+        if self.selected_clips.contains(&id) {
+            self.selected_clips.retain(|c| *c != id);
+            if self.selected_clip == Some(id) {
+                self.selected_clip = self.selected_clips.last().copied();
+            }
+            if self.selected_clips.is_empty() {
+                self.selected_clip = None;
+            }
+            return;
+        }
+        for cid in self.tracks[tk].clips.iter().map(|c| c.id) {
+            if !self.selected_clips.contains(&cid) {
+                self.selected_clips.push(cid);
+            }
+        }
+        self.selected_clip = Some(id);
+    }
+
+    /// The empty spans of a track's lane, in time order: before its first clip, between
+    /// its clips, and after the last one out to infinity (a track without clips is one
+    /// span from 0 on). Overlapping clips leave no span between them.
+    pub fn gaps_on(&self, tk: usize) -> Vec<(f64, f64)> {
+        let mut out = vec![];
+        let Some(tr) = self.tracks.get(tk) else {
+            return out;
+        };
+        let mut spans: Vec<(f64, f64)> = tr.clips.iter().map(|c| (c.start, c.end())).collect();
+        spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut prev = 0.0;
+        for (a, b) in spans {
+            if a > prev {
+                out.push((prev, a));
+            }
+            prev = prev.max(b);
+        }
+        out.push((prev, f64::INFINITY));
+        out
+    }
+
+    /// Shift+click on empty lane space: when the span clicked is already picked, that one
+    /// span leaves the selection; else every empty span of that row joins the selection
+    /// (the clips already picked stay picked).
+    pub fn select_row_gaps(&mut self, tk: usize, t: f64) {
+        let Some(trk) = self.tracks.get(tk).map(|t| t.id) else {
+            return;
+        };
+        // the span clicked already picked: it leaves, the rest stay
+        if let Some((a, b)) = self
+            .gaps_on(tk)
+            .into_iter()
+            .find(|(a, b)| t >= *a && t < *b)
+        {
+            let g = GapSel { trk, a, b };
+            if self.selected_gaps.contains(&g) {
+                self.selected_gaps.retain(|x| *x != g);
+                return;
+            }
+        }
+        for (a, b) in self.gaps_on(tk) {
+            let g = GapSel { trk, a, b };
+            if !self.selected_gaps.contains(&g) {
+                self.selected_gaps.push(g);
+            }
+        }
+    }
+
+    /// Ctrl+click on empty lane space: the span clicked joins the selection, or leaves it
+    /// when it was already picked.
+    pub fn toggle_gap(&mut self, tk: usize, t: f64) {
+        let (Some(trk), Some((a, b))) = (
+            self.tracks.get(tk).map(|t| t.id),
+            self.gaps_on(tk)
+                .into_iter()
+                .find(|(a, b)| t >= *a && t < *b),
+        ) else {
+            return;
+        };
+        let g = GapSel { trk, a, b };
+        if let Some(p) = self.selected_gaps.iter().position(|x| *x == g) {
+            self.selected_gaps.remove(p);
+        } else {
+            self.selected_gaps.push(g);
+        }
     }
 
     pub fn clear_selected_clips(&mut self) {
         self.selected_clips.clear();
         self.selected_clip = None;
+        self.selected_gaps.clear();
+    }
+
+    /// The clips a Move drag of `id` takes with it, each with where it sits now: the whole
+    /// selection when `id` is one of the picked clips (its group joins too, so grouped
+    /// clips still move together), else just `id`'s group. Several picked clips drag as
+    /// one unit.
+    pub fn drag_crew(&self, id: u64) -> Vec<(u64, f64, usize)> {
+        let mut ids: Vec<u64> = if self.selected_clips.contains(&id) {
+            self.selected_clips.clone()
+        } else {
+            vec![]
+        };
+        for g in self.group_of(id) {
+            if !ids.contains(&g) {
+                ids.push(g);
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        ids.iter()
+            .filter_map(|c| {
+                self.find_clip(*c)
+                    .map(|(tk, ci)| (*c, self.tracks[tk].clips[ci].start, tk))
+            })
+            .collect()
+    }
+
+    /// Drop selected clips that no longer exist (a ripple cut may have taken them); the
+    /// active one hands over to another picked clip or clears.
+    pub fn prune_selection(&mut self) {
+        let live: Vec<u64> = self
+            .selected_clips
+            .iter()
+            .filter(|id| self.find_clip(**id).is_some())
+            .copied()
+            .collect();
+        self.selected_clips = live;
+        if self
+            .selected_clip
+            .is_some_and(|a| self.find_clip(a).is_none())
+        {
+            self.selected_clip = self.selected_clips.last().copied();
+        }
+        if self.selected_clips.is_empty() {
+            self.selected_clip = None;
+        }
     }
 
     pub fn add_track(&mut self, stereo: bool) -> usize {
@@ -841,12 +1001,13 @@ impl Session {
         self.snapshot_with(lookup, &|_| None)
     }
 
-    /// Like [`Session::snapshot`]; `pre(track id)` returns a pre-rendered copy of a track (its
-    /// clips, clip effects and track effects, before the fader) to play instead.
+    /// Like [`Session::snapshot`]; `pre(track id)` returns the pre-rendered part of a track (its
+    /// clips, clip effects and track effects, before the fader): inside that range the track
+    /// plays the rendered audio, everywhere else it plays live.
     pub fn snapshot_with(
         &self,
         lookup: &dyn Fn(u64) -> Option<Arc<AudioData>>,
-        pre: &dyn Fn(u64) -> Option<Arc<AudioData>>,
+        pre: &dyn Fn(u64) -> Option<PreRange>,
     ) -> Mix {
         let any_solo = self.tracks.iter().any(|t| t.solo);
         let tracks = self
@@ -855,39 +1016,9 @@ impl Session {
             .map(|t| {
                 let vol = undb(t.volume_db);
                 let pan = t.pan.clamp(-1.0, 1.0);
-                let rendered = if t.prerender { pre(t.id) } else { None };
-                let (clips, rack, fx) = match rendered {
-                    Some(data) => {
-                        let len = data.duration();
-                        let one = MixClip {
-                            data,
-                            start: 0.0,
-                            offset: 0.0,
-                            len,
-                            gain: 1.0,
-                            fade_in: 0.0,
-                            fade_out: 0.0,
-                            xin: false,
-                            xout: false,
-                            env: vec![],
-                            id: u64::MAX - t.id,
-                            pan_env: vec![],
-                            rack: vec![],
-                            fx: RackOpts::default(),
-                            speed: 1.0,
-                            fin_curve: vec![],
-                            fout_curve: vec![],
-                        };
-                        (
-                            vec![one],
-                            vec![],
-                            RackOpts {
-                                pre_fader: t.fx.pre_fader,
-                                ..RackOpts::default()
-                            },
-                        )
-                    }
-                    None => {
+                let pre_range = if t.prerender { pre(t.id) } else { None };
+                let (clips, rack, fx): (Vec<MixClip>, Vec<EffectSlot>, RackOpts) = {
+                    {
                         let fades = effective_fades(t);
                         let clips = t
                             .clips
@@ -956,6 +1087,7 @@ impl Session {
                     vol,
                     polarity,
                     extra: track_mix_auto(t, rack_len_before_eq),
+                    pre: pre_range,
                 }
             })
             .collect();
@@ -1173,6 +1305,53 @@ pub struct MixTrack {
     pub polarity: f32,
     /// Mute, rack and effect-setting automation.
     pub extra: MixAuto,
+    /// The track's pre-rendered audio (clips and effects before the fader), played instead of
+    /// the live clips and rack for every block it covers.
+    pub pre: Option<PreRange>,
+}
+
+/// Frames in one shared piece of a pre-render (two render blocks).
+pub const PRE_CHUNK: usize = 8192;
+
+/// A contiguous pre-rendered stretch of one track, in shared pieces of [`PRE_CHUNK`] frames
+/// (only the last may be shorter), so a growing render reaches playback without copying.
+#[derive(Clone, Debug, Default)]
+pub struct PreRange {
+    /// Session time of the first frame.
+    pub start: f64,
+    pub rate: u32,
+    pub chunks: Vec<Arc<[Vec<f32>; 2]>>,
+}
+
+impl PreRange {
+    pub fn frames(&self) -> usize {
+        match self.chunks.last() {
+            Some(l) => (self.chunks.len() - 1) * PRE_CHUNK + l[0].len(),
+            None => 0,
+        }
+    }
+    /// Session time just after the last rendered frame.
+    pub fn end(&self) -> f64 {
+        self.start + self.frames() as f64 / self.rate.max(1) as f64
+    }
+    /// True when every frame of `[t0, t1)` is rendered.
+    pub fn covers(&self, t0: f64, t1: f64) -> bool {
+        !self.chunks.is_empty() && t0 >= self.start - 1e-9 && t1 <= self.end() + 1e-9
+    }
+    /// The rendered frame at session time `t` (left, right); silence outside.
+    #[inline]
+    pub fn frame_at(&self, t: f64) -> (f32, f32) {
+        let x = (t - self.start) * self.rate as f64;
+        if x < -0.5 {
+            return (0.0, 0.0);
+        }
+        let i = (x + 0.5) as usize;
+        let (c, o) = (i / PRE_CHUNK, i % PRE_CHUNK);
+        match self.chunks.get(c) {
+            Some(ch) if o < ch[0].len() && o < ch[1].len() => (ch[0][o], ch[1][o]),
+            _ => (0.0, 0.0),
+        }
+    }
 }
 
 impl MixTrack {
@@ -1340,7 +1519,20 @@ pub fn render_mix(
             c.resize(n, 0.0);
         }
         let mut any = false;
+        // a pre-rendered stretch covering this block replaces the live clips and rack
+        let use_pre = t.pre.as_ref().filter(|p| p.covers(t0, t1));
+        if let Some(pr) = use_pre {
+            for i in 0..n {
+                let (l, r) = pr.frame_at(t0 + i as f64 * dt);
+                tmp[0][i] = l;
+                tmp[1][i] = r;
+            }
+            any = true;
+        }
         for c in &t.clips {
+            if use_pre.is_some() {
+                break;
+            }
             if c.start >= t1 || c.start + c.len <= t0 {
                 continue;
             }
@@ -1415,8 +1607,9 @@ pub fn render_mix(
                 cache.cbuf = buf;
             }
         }
-        // post-fader racks see the track's volume, pan and automation first
-        let pre = t.fx.pre_fader;
+        // post-fader racks see the track's volume, pan and automation first (a pre-render
+        // holds the rack's output already: its fader comes after, once)
+        let pre = t.fx.pre_fader || use_pre.is_some();
         if !pre {
             for i in 0..n {
                 let tt = t0 + i as f64 * dt;
@@ -1427,7 +1620,7 @@ pub fn render_mix(
             }
         }
         // automated effect settings: the rack's chain follows them, block by block
-        if !t.extra.fx.is_empty() {
+        if !t.extra.fx.is_empty() && use_pre.is_none() {
             let mut rack = t.rack.clone();
             for (slot, name, path, env) in &t.extra.fx {
                 if let Some(s) = rack.get_mut(*slot) {
@@ -1446,7 +1639,7 @@ pub fn render_mix(
         let fx_now = t.extra.rack_opts(&t.fx, t0);
         let fxo = fx_now.as_ref().unwrap_or(&t.fx);
         // run the track rack even without clips so tails ring out
-        if let Some((_, chain)) = cache.chains.get_mut(ti) {
+        if let Some((_, chain)) = cache.chains.get_mut(ti).filter(|_| use_pre.is_none()) {
             if !fxo.is_neutral(chain.is_empty()) {
                 crate::dsp::run_rack(chain, fxo, tmp, &mut cache.dry);
                 any = true;
@@ -1564,33 +1757,110 @@ pub fn match_clip_loudness(
 }
 
 pub fn mixdown(mix: &Mix, rate: u32, a: f64, b: f64) -> AudioData {
-    let mut cache = ChainCache::default();
-    cache.sync(mix, rate as f32);
-    let total = ((b - a).max(0.0) * rate as f64) as usize;
-    let mut res = AudioData::new(rate, 2, 0);
-    let mut out = vec![];
-    let mut tmp = vec![];
-    let mut peaks = vec![];
-    let block = 4096;
-    let mut done = 0usize;
-    while done < total {
-        let n = block.min(total - done);
-        let t0 = a + done as f64 / rate as f64;
-        render_mix(
-            mix,
-            &mut cache,
-            rate as f32,
-            t0,
-            n,
-            &mut out,
-            &mut tmp,
-            &mut peaks,
-        );
-        res.ch[0].extend_from_slice(&out[0]);
-        res.ch[1].extend_from_slice(&out[1]);
-        done += n;
+    let mut r = MixRender::new(mix, rate, a, b);
+    while !r.step(mix, usize::MAX) {}
+    r.finish()
+}
+
+/// A mixdown made a few blocks at a time, so a long render (a pre-rendered track) can run a
+/// little every frame while the window stays responsive and a gauge shows how far it got. The
+/// effect chains keep their state between steps, so the result is the same as one mixdown.
+pub struct MixRender {
+    cache: ChainCache,
+    rate: u32,
+    a: f64,
+    total: usize,
+    done: usize,
+    out: Vec<Vec<f32>>,
+    tmp: Vec<Vec<f32>>,
+    peaks: Vec<[f32; 2]>,
+    res: AudioData,
+}
+
+impl MixRender {
+    pub const BLOCK: usize = 4096;
+
+    pub fn new(mix: &Mix, rate: u32, a: f64, b: f64) -> Self {
+        let rate = rate.max(1);
+        let mut cache = ChainCache::default();
+        cache.sync(mix, rate as f32);
+        let total = ((b - a).max(0.0) * rate as f64) as usize;
+        Self {
+            cache,
+            rate,
+            a,
+            total,
+            done: 0,
+            out: vec![],
+            tmp: vec![],
+            peaks: vec![],
+            res: AudioData::new(rate, 2, 0),
+        }
     }
-    res
+
+    /// Render up to `blocks` more blocks of `mix` (the same mix every step); true once the
+    /// whole range is rendered.
+    pub fn step(&mut self, mix: &Mix, blocks: usize) -> bool {
+        let mut left = blocks;
+        while self.done < self.total && left > 0 {
+            let n = Self::BLOCK.min(self.total - self.done);
+            let t0 = self.a + self.done as f64 / self.rate as f64;
+            render_mix(
+                mix,
+                &mut self.cache,
+                self.rate as f32,
+                t0,
+                n,
+                &mut self.out,
+                &mut self.tmp,
+                &mut self.peaks,
+            );
+            if self.out.len() >= 2 {
+                self.res.ch[0].extend_from_slice(&self.out[0]);
+                self.res.ch[1].extend_from_slice(&self.out[1]);
+            }
+            self.done += n;
+            left -= 1;
+        }
+        self.done >= self.total
+    }
+
+    /// How much of the range is rendered, 0..=1 (an empty range counts as done).
+    pub fn progress(&self) -> f32 {
+        if self.total == 0 {
+            1.0
+        } else {
+            (self.done as f64 / self.total as f64).clamp(0.0, 1.0) as f32
+        }
+    }
+
+    /// Session time (seconds) the render has reached.
+    pub fn reached(&self) -> f64 {
+        self.a + self.done as f64 / self.rate as f64
+    }
+
+    /// Session time (seconds) where the render ends.
+    pub fn end(&self) -> f64 {
+        self.a + self.total as f64 / self.rate as f64
+    }
+
+    pub fn finish(self) -> AudioData {
+        self.res
+    }
+
+    /// Take the frames rendered since the last call (left, right), so a pre-render can share
+    /// them in pieces instead of keeping one growing copy.
+    pub fn drain(&mut self) -> [Vec<f32>; 2] {
+        let l = std::mem::take(&mut self.res.ch[0]);
+        let r = std::mem::take(&mut self.res.ch[1]);
+        [l, r]
+    }
+
+    /// Move where the render stops (session seconds); it never goes back before what is done.
+    pub fn set_end(&mut self, b: f64) {
+        let total = ((b - self.a).max(0.0) * self.rate as f64) as usize;
+        self.total = total.max(self.done);
+    }
 }
 
 #[cfg(test)]

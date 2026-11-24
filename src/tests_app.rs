@@ -13,6 +13,8 @@ pub struct Harness {
     pub app: App,
     frame: eframe::Frame,
     size: egui::Vec2,
+    /// When set, each frame is 1/60 s after the last (pointer speed is then real).
+    pub clock: Option<f64>,
 }
 
 /// The file handle egui receives when the operating system drops a file on the window.
@@ -42,6 +44,7 @@ impl Harness {
             app,
             frame: eframe::Frame::_new_kittest(),
             size: vec2(1600.0, 1000.0),
+            clock: None,
         };
         h.frames(2);
         h
@@ -56,9 +59,13 @@ impl Harness {
     pub fn frames_with(&mut self, n: usize, events: Vec<egui::Event>) {
         let mut events = Some(events);
         for _ in 0..n {
+            if let Some(c) = self.clock.as_mut() {
+                *c += 1.0 / 60.0;
+            }
             let raw = egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, self.size)),
                 events: events.take().unwrap_or_default(),
+                time: self.clock,
                 ..Default::default()
             };
             let (app, frame) = (&mut self.app, &mut self.frame);
@@ -99,6 +106,54 @@ impl Harness {
         };
         self.frames_with(1, vec![egui::Event::PointerMoved(p), ev(true)]);
         self.frames_with(2, vec![ev(false)]);
+    }
+
+    /// A click at `p` with modifier keys held (press and release). The modifiers are set for
+    /// both the press and the release, then cleared again.
+    pub fn click_mods(&mut self, p: Pos2, mods: egui::Modifiers) {
+        let ev = |pressed| egui::Event::PointerButton {
+            pos: p,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: mods,
+        };
+        self.frames_with(
+            1,
+            vec![
+                egui::Event::ModifiersChanged(mods),
+                egui::Event::PointerMoved(p),
+                ev(true),
+            ],
+        );
+        self.frames_with(2, vec![egui::Event::ModifiersChanged(mods), ev(false)]);
+        self.frames_with(1, vec![egui::Event::ModifiersChanged(Default::default())]);
+    }
+
+    /// Press at `from`, drag to `to` (with modifiers held the whole way), release there.
+    pub fn drag_mods(&mut self, from: Pos2, to: Pos2, mods: egui::Modifiers) {
+        let ev = |pos: Pos2, pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: mods,
+        };
+        self.frames_with(
+            1,
+            vec![
+                egui::Event::ModifiersChanged(mods),
+                egui::Event::PointerMoved(from),
+                ev(from, true),
+            ],
+        );
+        self.frames_with(
+            2,
+            vec![
+                egui::Event::ModifiersChanged(mods),
+                egui::Event::PointerMoved(to),
+            ],
+        );
+        self.frames_with(2, vec![ev(to, false)]);
+        self.frames_with(1, vec![egui::Event::ModifiersChanged(Default::default())]);
     }
 
     pub fn run(&mut self, id: &str) -> Result<(), String> {
@@ -1778,7 +1833,10 @@ fn clicking_a_clip_after_a_keyframe_makes_delete_remove_the_clip() {
             );
             {
                 let s = h.app.session.as_ref().unwrap();
-                assert_eq!(s.selected_clip, None, "{tool:?}: no clip stays selected with a keyframe");
+                assert_eq!(
+                    s.selected_clip, None,
+                    "{tool:?}: no clip stays selected with a keyframe"
+                );
                 assert!(s.selected_clips.is_empty());
             }
             let target = if click_b { b } else { a };
@@ -1800,10 +1858,17 @@ fn clicking_a_clip_after_a_keyframe_makes_delete_remove_the_clip() {
                 }],
             );
             let s = h.app.session.as_ref().unwrap();
-            assert!(s.find_clip(target).is_none(), "{tool:?} click_b={click_b}: the clip was deleted");
+            assert!(
+                s.find_clip(target).is_none(),
+                "{tool:?} click_b={click_b}: the clip was deleted"
+            );
             if !click_b {
                 let (bt, bi) = s.find_clip(b).unwrap();
-                assert_eq!(s.tracks[bt].clips[bi].env.len(), 2, "{tool:?}: the keyframe stayed");
+                assert_eq!(
+                    s.tracks[bt].clips[bi].env.len(),
+                    2,
+                    "{tool:?}: the keyframe stayed"
+                );
             }
         }
     }
@@ -1847,14 +1912,24 @@ fn a_keyframe_added_on_a_line_is_the_only_selection() {
         let c = &s.tracks[0].clips[0];
         let (rect, _, view) = h.app.multi_drag.geom.clone().unwrap();
         let t = c.start + c.len * 0.15;
-        (rect.left() + ((t - view.0) / (view.1 - view.0)) as f32 * rect.width(), spot0.y)
+        (
+            rect.left() + ((t - view.0) / (view.1 - view.0)) as f32 * rect.width(),
+            spot0.y,
+        )
     };
     h.click(Pos2::new(x, y));
     {
         let s = h.app.session.as_ref().unwrap();
-        assert_eq!(s.tracks[0].clips[0].env.len(), 3, "a keyframe was added on the line");
+        assert_eq!(
+            s.tracks[0].clips[0].env.len(),
+            3,
+            "a keyframe was added on the line"
+        );
         assert_eq!(h.app.multi_drag.key_sel.target, Some(EnvTarget::ClipVol(b)));
-        assert_eq!(s.selected_clip, None, "the clip picked before is no longer selected");
+        assert_eq!(
+            s.selected_clip, None,
+            "the clip picked before is no longer selected"
+        );
         assert!(s.selected_clips.is_empty());
     }
     let ctx = h.ctx.clone();
@@ -1862,7 +1937,11 @@ fn a_keyframe_added_on_a_line_is_the_only_selection() {
     {
         let s = h.app.session.as_ref().unwrap();
         assert!(s.find_clip(a).is_some(), "clip A stays");
-        assert_eq!(s.tracks[0].clips[0].env.len(), 2, "only the new keyframe went");
+        assert_eq!(
+            s.tracks[0].clips[0].env.len(),
+            2,
+            "only the new keyframe went"
+        );
     }
     // pick a keyframe, then select the track's clips from the menu: the keyframe is dropped
     h.app.multi_drag.key_sel.only(EnvTarget::ClipVol(b), 1);
@@ -1870,7 +1949,10 @@ fn a_keyframe_added_on_a_line_is_the_only_selection() {
     h.app.exec("edit.select_track_clips", &ctx).unwrap();
     h.frames(2);
     assert_eq!(h.app.session.as_ref().unwrap().selected_clip, Some(b));
-    assert!(h.app.multi_drag.key_sel.is_empty(), "selecting clips drops the keyframes");
+    assert!(
+        h.app.multi_drag.key_sel.is_empty(),
+        "selecting clips drops the keyframes"
+    );
 }
 
 /// A clip and a keyframe are never selected together: picking a keyframe on clip B selects B
@@ -1888,12 +1970,21 @@ fn clip_and_keyframe_selection_exclude_each_other() {
     h.app.session.as_mut().unwrap().selected_clip = Some(a);
     // a keyframe on the other clip (B) is picked
     h.app.session.as_mut().unwrap().tracks[0].clips[0].env = vec![(0.5, 0.0), (1.0, -6.0)];
-    h.app.multi_drag.key_sel.only(crate::keys::EnvTarget::ClipVol(b), 0);
+    h.app
+        .multi_drag
+        .key_sel
+        .only(crate::keys::EnvTarget::ClipVol(b), 0);
     h.frames(2);
     let s = h.app.session.as_ref().unwrap();
-    assert_eq!(s.selected_clip, None, "picking a keyframe deselects every clip");
+    assert_eq!(
+        s.selected_clip, None,
+        "picking a keyframe deselects every clip"
+    );
     assert!(s.selected_clips.is_empty());
-    assert_eq!(s.selected_track, 0, "the keyframe's track is the current one");
+    assert_eq!(
+        s.selected_track, 0,
+        "the keyframe's track is the current one"
+    );
     // click clip A in its body, away from the visible pan/envelope line (clicking that line
     // correctly adds a new keyframe instead of just picking the clip)
     let (rect, rows, view) = h.app.multi_drag.geom.clone().expect("layout");
@@ -1901,7 +1992,10 @@ fn clip_and_keyframe_selection_exclude_each_other() {
     let x = rect.left() + ((t - view.0) / (view.1 - view.0)) as f32 * rect.width();
     let y = rows[1].center().y + 32.0;
     h.click(Pos2::new(x, y));
-    assert!(h.app.multi_drag.key_sel.is_empty(), "clicking the clip dropped the keyframe");
+    assert!(
+        h.app.multi_drag.key_sel.is_empty(),
+        "clicking the clip dropped the keyframe"
+    );
     assert_eq!(h.app.session.as_ref().unwrap().selected_clip, Some(a));
     // Delete removes clip A, and B keeps its keyframes
     let ctx = h.ctx.clone();
@@ -1909,5 +2003,939 @@ fn clip_and_keyframe_selection_exclude_each_other() {
     let s = h.app.session.as_ref().unwrap();
     assert!(s.find_clip(a).is_none(), "clip A was deleted");
     let (bt, bi) = s.find_clip(b).unwrap();
-    assert_eq!(s.tracks[bt].clips[bi].env.len(), 2, "the keyframe was left alone");
+    assert_eq!(
+        s.tracks[bt].clips[bi].env.len(),
+        2,
+        "the keyframe was left alone"
+    );
+}
+
+/// The person's request: Shift+click on a clip selects every clip in that clip's row,
+/// Shift+click on empty lane space selects every empty span of the row, and Ctrl+click
+/// toggles the one clip or span clicked. Both work with the black mouse tool (Move)
+/// anywhere, and with any other tool only over a clip's top bar.
+#[test]
+fn shift_and_ctrl_clicks_select_rows_and_toggle_singles() {
+    let mut h = Harness::new(true, true);
+    h.app.tool = crate::app::Tool::Move;
+    h.frames(2);
+    let (a, b, c) = {
+        let s = h.app.session.as_ref().unwrap();
+        (
+            s.tracks[1].clips[0].id,
+            s.tracks[0].clips[0].id,
+            s.tracks[1].clips[1].id,
+        )
+    };
+    // a clip's body (deep enough to stay off its envelopes) and its top bar
+    let body = |h: &Harness, id: u64| {
+        let s = h.app.session.as_ref().unwrap();
+        let (ti, ci) = s.find_clip(id).unwrap();
+        let cl = &s.tracks[ti].clips[ci];
+        let (rect, rows, view) = h.app.multi_drag.geom.clone().expect("layout");
+        let t = cl.start + cl.len * 0.15;
+        let x = rect.left() + ((t - view.0) / (view.1 - view.0)) as f32 * rect.width();
+        Pos2::new(x, rows[ti].center().y + 32.0)
+    };
+    let top = |h: &Harness, id: u64| {
+        let s = h.app.session.as_ref().unwrap();
+        let (ti, ci) = s.find_clip(id).unwrap();
+        let cl = &s.tracks[ti].clips[ci];
+        let (rect, rows, view) = h.app.multi_drag.geom.clone().expect("layout");
+        let t = cl.start + cl.len * 0.15;
+        let x = rect.left() + ((t - view.0) / (view.1 - view.0)) as f32 * rect.width();
+        Pos2::new(x, rows[ti].top() + 7.0)
+    };
+    // empty lane space of a row at time `t`
+    let space = |h: &Harness, ti: usize, t: f64| {
+        let (rect, rows, view) = h.app.multi_drag.geom.clone().expect("layout");
+        let x = rect.left() + ((t - view.0) / (view.1 - view.0)) as f32 * rect.width();
+        Pos2::new(x, rows[ti].center().y)
+    };
+    let sel = |h: &Harness| {
+        let s = h.app.session.as_ref().unwrap();
+        (s.selected_clips.clone(), s.selected_gaps.clone())
+    };
+    let (pa, pb) = (body(&h, a), body(&h, b));
+    // a plain click picks one clip
+    h.click(pb);
+    assert_eq!(sel(&h).0, vec![b]);
+    // Shift+click on a clip in the other row: that whole row joins, the first stays
+    h.click_mods(pa, egui::Modifiers::SHIFT);
+    {
+        let s = h.app.session.as_ref().unwrap();
+        assert_eq!(s.selected_clips.len(), 3, "both rows are picked");
+        assert!(s.selected_clips.contains(&a) && s.selected_clips.contains(&c));
+        assert_eq!(
+            s.selected_clip,
+            Some(a),
+            "the clip clicked is the active one"
+        );
+    }
+    // Shift+click on the same clip again: that clip leaves the selection (the person's
+    // rule: Shift+click un-picks what is already selected)
+    h.click_mods(pa, egui::Modifiers::SHIFT);
+    {
+        let s = h.app.session.as_ref().unwrap();
+        assert!(
+            !s.selected_clips.contains(&a),
+            "the picked clip leaves the set"
+        );
+        assert_eq!(s.selected_clips.len(), 2);
+        assert_eq!(s.selected_clip, Some(c), "the active role hands over");
+    }
+    // a clip outside the set brings its row back in
+    h.click_mods(pa, egui::Modifiers::SHIFT);
+    assert_eq!(sel(&h).0.len(), 3);
+    // Ctrl+click toggles the one clip: out, then back in
+    h.click_mods(pa, egui::Modifiers::CTRL);
+    assert_eq!(
+        sel(&h).0,
+        vec![b, c],
+        "the clip clicked alone leaves the set"
+    );
+    h.click_mods(pa, egui::Modifiers::CTRL);
+    assert_eq!(sel(&h).0.len(), 3);
+    // Shift+click on empty space: every empty span of that row (before the clip and the
+    // open end after it), the clips stay picked
+    h.click_mods(space(&h, 0, 0.2), egui::Modifiers::SHIFT);
+    {
+        let s = h.app.session.as_ref().unwrap();
+        assert_eq!(s.selected_gaps.len(), 2, "the row's two empty spans");
+        assert!(s.selected_gaps.iter().all(|g| g.trk == s.tracks[0].id));
+        assert_eq!(s.selected_gaps[0].a, 0.0, "the span before the first clip");
+        assert!(s.selected_gaps.iter().any(|g| g.b.is_infinite()));
+        assert_eq!(s.selected_clips.len(), 3, "the clips stay picked");
+    }
+    // Shift+click on a span already picked: that span alone leaves the set
+    h.click_mods(space(&h, 0, 0.2), egui::Modifiers::SHIFT);
+    {
+        let s = h.app.session.as_ref().unwrap();
+        assert_eq!(s.selected_gaps.len(), 1, "the span clicked leaves the set");
+        assert!(
+            s.selected_gaps[0].b.is_infinite(),
+            "the open end stays picked"
+        );
+        assert_eq!(s.selected_clips.len(), 3, "the clips stay picked");
+    }
+    // an unpicked span brings the row's spans back
+    h.click_mods(space(&h, 0, 0.2), egui::Modifiers::SHIFT);
+    assert_eq!(sel(&h).1.len(), 2);
+    // Ctrl+click on empty space toggles the one span clicked
+    h.click_mods(space(&h, 0, 0.2), egui::Modifiers::CTRL);
+    {
+        let s = h.app.session.as_ref().unwrap();
+        assert_eq!(
+            s.selected_gaps.len(),
+            1,
+            "the span clicked alone leaves the set"
+        );
+        assert!(s.selected_gaps[0].b.is_infinite());
+    }
+    // a plain click on empty ground clears clips and spans together
+    h.click(space(&h, 0, 0.2));
+    {
+        let s = h.app.session.as_ref().unwrap();
+        assert!(s.selected_clips.is_empty() && s.selected_gaps.is_empty());
+    }
+    // with the Time Selection tool, a Shift+click on a clip's body is the tool's own
+    // click: one clip, not the row
+    h.app.tool = crate::app::Tool::TimeSel;
+    h.frames(2);
+    h.click_mods(pa, egui::Modifiers::SHIFT);
+    assert_eq!(sel(&h).0, vec![a], "the body keeps the tool's click");
+    assert!(
+        sel(&h).1.is_empty(),
+        "empty space needs the black mouse tool"
+    );
+    // over the clip's top bar every tool grabs the clip: the row is selected there.
+    // c is not picked yet, so its row joins — a Shift+click on the already-picked a
+    // would instead un-pick a, the new rule
+    h.click_mods(top(&h, c), egui::Modifiers::SHIFT);
+    {
+        let s = h.app.session.as_ref().unwrap();
+        assert_eq!(s.selected_clips.len(), 2, "the top bar selects the row");
+        assert!(s.selected_clips.contains(&a) && s.selected_clips.contains(&c));
+    }
+    // Ctrl+click on the top bar toggles the one clip with any tool
+    h.click_mods(top(&h, c), egui::Modifiers::CTRL);
+    {
+        let s = h.app.session.as_ref().unwrap();
+        assert_eq!(
+            s.selected_clips,
+            vec![a],
+            "the toggled clip alone leaves the set"
+        );
+    }
+}
+
+/// The person's request: several selected clips drag as one unit. Both beat clips of the
+/// demo's second track get picked with one Shift+click; dragging either of them moves
+/// both by the same time and the same rows, and Alt+drag leaves copies of the whole unit
+/// behind while the originals stay put.
+#[test]
+fn selected_clips_drag_as_one_unit() {
+    let mut h = Harness::new(true, true);
+    h.app.tool = crate::app::Tool::Move;
+    h.app.snapping = false;
+    h.frames(2);
+    let (b1, b2, m) = {
+        let s = h.app.session.as_ref().unwrap();
+        (
+            s.tracks[1].clips[0].id,
+            s.tracks[1].clips[1].id,
+            s.tracks[0].clips[0].id,
+        )
+    };
+    // a point in a clip's body at time `t`, and one at the same time on another row
+    let at = |h: &Harness, id: u64, off: f64| {
+        let s = h.app.session.as_ref().unwrap();
+        let (ti, ci) = s.find_clip(id).unwrap();
+        let c = &s.tracks[ti].clips[ci];
+        let (rect, rows, view) = h.app.multi_drag.geom.clone().expect("layout");
+        let t = c.start + c.len * 0.15 + off;
+        let x = rect.left() + ((t - view.0) / (view.1 - view.0)) as f32 * rect.width();
+        Pos2::new(x, rows[ti].center().y + 32.0)
+    };
+    let row_at = |h: &Harness, id: u64, row: usize, off: f64| {
+        let s = h.app.session.as_ref().unwrap();
+        let (ti, ci) = s.find_clip(id).unwrap();
+        let c = &s.tracks[ti].clips[ci];
+        let (rect, rows, view) = h.app.multi_drag.geom.clone().expect("layout");
+        let t = c.start + c.len * 0.15 + off;
+        let x = rect.left() + ((t - view.0) / (view.1 - view.0)) as f32 * rect.width();
+        Pos2::new(x, rows[row].center().y + 32.0)
+    };
+    let near = |a: f64, b: f64| (a - b).abs() < 1e-6;
+    let places = |h: &Harness| {
+        let s = h.app.session.as_ref().unwrap();
+        (
+            s.find_clip(b1)
+                .map(|(t, c)| (t, s.tracks[t].clips[c].start)),
+            s.find_clip(b2)
+                .map(|(t, c)| (t, s.tracks[t].clips[c].start)),
+            s.find_clip(m).map(|(t, c)| (t, s.tracks[t].clips[c].start)),
+        )
+    };
+    // Shift+click one beat: the whole row is picked
+    h.click_mods(at(&h, b1, 0.0), egui::Modifiers::SHIFT);
+    {
+        let s = h.app.session.as_ref().unwrap();
+        assert_eq!(s.selected_clips.len(), 2, "the row's two clips are picked");
+    }
+    let (o1, o2, om) = places(&h);
+    // drag one of them a second right: both move by the same second
+    h.drag_mods(at(&h, b1, 0.0), at(&h, b1, 1.0), Default::default());
+    let (n1, n2, nm) = places(&h);
+    {
+        let s = h.app.session.as_ref().unwrap();
+        assert_eq!(s.selected_clips.len(), 2, "the unit stays picked");
+        assert!(
+            near(n1.unwrap().1 - o1.unwrap().1, 1.0),
+            "the grabbed clip moved 1s"
+        );
+        assert!(
+            near(n2.unwrap().1 - o2.unwrap().1, 1.0),
+            "the other picked clip moved the same 1s"
+        );
+        assert!(
+            near(nm.unwrap().1, om.unwrap().1),
+            "the melody on the other track did not move"
+        );
+        assert_eq!(n1.unwrap().0, o1.unwrap().0, "same rows as before");
+    }
+    // drag the unit one row down: both clips land on that row together
+    h.drag_mods(at(&h, b2, 0.0), row_at(&h, b2, 2, 0.0), Default::default());
+    let (n1, n2, _) = places(&h);
+    {
+        let s = h.app.session.as_ref().unwrap();
+        assert!(
+            n1.unwrap().0 == 2 && n2.unwrap().0 == 2,
+            "both on the third row"
+        );
+        assert_eq!(s.selected_track, 2);
+    }
+    // Alt+drag the unit half a second right: the originals stay put and the copies go
+    h.drag_mods(
+        at(&h, b1, 0.0),
+        at(&h, b1, 0.5),
+        egui::Modifiers {
+            alt: true,
+            ..Default::default()
+        },
+    );
+    {
+        let s = h.app.session.as_ref().unwrap();
+        let row = &s.tracks[2].clips;
+        assert_eq!(row.len(), 4, "two originals and two copies");
+        let mut starts: Vec<f64> = row.iter().map(|c| c.start).collect();
+        starts.sort_by(|a, b| a.total_cmp(b));
+        let want = [
+            o1.unwrap().1 + 1.0,
+            o1.unwrap().1 + 1.5,
+            o2.unwrap().1 + 1.0,
+            o2.unwrap().1 + 1.5,
+        ];
+        for (g, w) in starts.iter().zip(want.iter()) {
+            assert!(
+                near(*g, *w),
+                "the copies sit half a second after the originals"
+            );
+        }
+        assert_eq!(
+            s.selected_clips.len(),
+            2,
+            "the copies are the selection now"
+        );
+    }
+}
+
+/// The person's delete rules, pressed like a person presses them: Delete/Backspace
+/// removes every picked clip and leaves the space it occupied; Shift+Delete/Shift+
+/// Backspace ripples, pulling the later clips of the track left into the closed gap.
+#[test]
+fn delete_key_removes_all_picked_and_shift_delete_ripples() {
+    let mut h = Harness::new(true, true);
+    h.app.tool = crate::app::Tool::Move;
+    h.frames(2);
+    let (b1, b2, m) = {
+        let s = h.app.session.as_ref().unwrap();
+        (
+            s.tracks[1].clips[0].id,
+            s.tracks[1].clips[1].id,
+            s.tracks[0].clips[0].id,
+        )
+    };
+    let body = |h: &Harness, id: u64, frac: f64| {
+        let s = h.app.session.as_ref().unwrap();
+        let (ti, ci) = s.find_clip(id).unwrap();
+        let c = &s.tracks[ti].clips[ci];
+        let (rect, rows, view) = h.app.multi_drag.geom.clone().expect("layout");
+        let t = c.start + c.len * frac;
+        let x = rect.left() + ((t - view.0) / (view.1 - view.0)) as f32 * rect.width();
+        Pos2::new(x, rows[ti].center().y + 32.0)
+    };
+    let key = |h: &mut Harness, key: egui::Key, shift: bool| {
+        let mods = if shift {
+            egui::Modifiers::SHIFT
+        } else {
+            egui::Modifiers::NONE
+        };
+        h.frames_with(
+            2,
+            vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: mods,
+            }],
+        );
+    };
+    let cmd_key = |h: &mut Harness, key: egui::Key| {
+        // the real backend marks Ctrl as the command key; a bare `CTRL` would not match
+        h.frames_with(
+            2,
+            vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::COMMAND,
+            }],
+        );
+    };
+    // pick both beats with one Shift+click, then Delete: every picked clip goes
+    h.click_mods(body(&h, b1, 0.15), egui::Modifiers::SHIFT);
+    key(&mut h, egui::Key::Delete, false);
+    {
+        let s = h.app.session.as_ref().unwrap();
+        assert!(
+            s.find_clip(b1).is_none() && s.find_clip(b2).is_none(),
+            "both beats went"
+        );
+        assert!(s.find_clip(m).is_some(), "the melody stays");
+        assert!(s.selected_clips.is_empty() && s.selected_clip.is_none());
+    }
+    // Ctrl+Z brings them back, then Shift+Delete on the first beat alone ripples
+    cmd_key(&mut h, egui::Key::Z);
+    {
+        let s = h.app.session.as_ref().unwrap();
+        assert!(
+            s.find_clip(b1).is_some() && s.find_clip(b2).is_some(),
+            "undo brought them back"
+        );
+        let (t, c) = s.find_clip(b2).unwrap();
+        let old = s.tracks[t].clips[c].start;
+        assert!(old > 3.0, "the second beat sits past the first (setup)");
+    }
+    // click the first beat back in — at a different spot than the Shift+click, so the
+    // two presses do not count as one double-click (which would open the clip's source)
+    h.click(body(&h, b1, 0.6));
+    key(&mut h, egui::Key::Delete, true);
+    {
+        let s = h.app.session.as_ref().unwrap();
+        assert!(s.find_clip(b1).is_none(), "the first beat went");
+        let (t, c) = s.find_clip(b2).unwrap();
+        let b = &s.tracks[t].clips[c];
+        assert!(
+            (b.start - 0.5).abs() < 1e-6,
+            "the second beat pulled left into the closed gap: {}",
+            b.start
+        );
+    }
+    // Backspace works the same way, with and without Shift
+    h.click(body(&h, b2, 0.15));
+    key(&mut h, egui::Key::Backspace, true);
+    assert!(
+        h.app.session.as_ref().unwrap().find_clip(b2).is_none(),
+        "Shift+Backspace too"
+    );
+    assert!(
+        h.app.session.as_ref().unwrap().find_clip(m).is_some(),
+        "the melody still there"
+    );
+}
+
+/// The person's request: selecting empty space and pressing Delete ripple-deletes the
+/// space too — the picked span closes and what follows on that track pulls left.
+#[test]
+fn delete_on_picked_empty_space_closes_the_gap() {
+    let mut h = Harness::new(true, true);
+    h.app.tool = crate::app::Tool::Move;
+    h.frames(2);
+    let (m, m_start) = {
+        let s = h.app.session.as_ref().unwrap();
+        let c = &s.tracks[0].clips[0];
+        (c.id, c.start)
+    };
+    let space = |h: &Harness, t: f64| {
+        let (rect, rows, view) = h.app.multi_drag.geom.clone().expect("layout");
+        let x = rect.left() + ((t - view.0) / (view.1 - view.0)) as f32 * rect.width();
+        Pos2::new(x, rows[0].center().y)
+    };
+    // the span before the melody and the open tail are the row's two empty spans
+    h.click_mods(space(&h, 0.2), egui::Modifiers::SHIFT);
+    {
+        let s = h.app.session.as_ref().unwrap();
+        assert_eq!(s.selected_gaps.len(), 2, "the row's two empty spans");
+        assert!(s.selected_clips.is_empty(), "no clip is picked with them");
+    }
+    // Delete closes the picked space: the melody pulls to the start of the timeline
+    h.frames_with(
+        2,
+        vec![egui::Event::Key {
+            key: egui::Key::Delete,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        }],
+    );
+    {
+        let s = h.app.session.as_ref().unwrap();
+        assert!(s.selected_gaps.is_empty(), "the span selection is spent");
+        let (t, c) = s.find_clip(m).unwrap();
+        let now = s.tracks[t].clips[c].start;
+        assert!(
+            now.abs() < 1e-6,
+            "the melody pulled left by the closed span (was {}): {}",
+            m_start,
+            now
+        );
+    }
+}
+
+/// The person's request: holding Shift while dragging locks the move to the main 8
+/// directions. A mostly-upward drag moves the clip straight up (its time stands still),
+/// a mostly-rightward drag moves it along its own track only, and without Shift the drag
+/// is as free as before.
+#[test]
+fn shift_dragging_a_clip_locks_it_to_the_axes() {
+    let mut h = Harness::new(true, true);
+    h.app.tool = crate::app::Tool::Move;
+    h.app.snapping = false;
+    h.frames(2);
+    let id = h.app.session.as_ref().unwrap().tracks[1].clips[0].id;
+    let body = |h: &Harness| {
+        let s = h.app.session.as_ref().unwrap();
+        let (ti, ci) = s.find_clip(id).unwrap();
+        let c = &s.tracks[ti].clips[ci];
+        let (rect, rows, view) = h.app.multi_drag.geom.clone().expect("layout");
+        let t = c.start + c.len * 0.15;
+        let x = rect.left() + ((t - view.0) / (view.1 - view.0)) as f32 * rect.width();
+        Pos2::new(x, rows[ti].center().y + 32.0)
+    };
+    let pa = body(&h);
+    let rate = h.app.session.as_ref().unwrap().rate as f64;
+    // a mostly-upward drag (a little to the right, far up) with Shift: straight up only
+    let up = {
+        let (_, rows, _) = h.app.multi_drag.geom.clone().unwrap();
+        Pos2::new(pa.x + 10.0, rows[0].center().y + 32.0)
+    };
+    h.drag_mods(pa, up, egui::Modifiers::SHIFT);
+    {
+        let s = h.app.session.as_ref().unwrap();
+        let (ti, ci) = s.find_clip(id).expect("the clip is still there");
+        assert_eq!(ti, 0, "the clip moved to the track above");
+        assert!(
+            (s.tracks[ti].clips[ci].start - 0.0).abs() < 2.0 / rate,
+            "its start time did not move: {}",
+            s.tracks[ti].clips[ci].start
+        );
+    }
+    // a mostly-rightward drag (a little down, far right) with Shift: along the track only
+    h.frames(2);
+    let pb = body(&h);
+    let (_, rows, _) = h.app.multi_drag.geom.clone().unwrap();
+    let dt = {
+        let (rect, _, view) = h.app.multi_drag.geom.clone().unwrap();
+        60.0 / rect.width() as f64 * (view.1 - view.0)
+    };
+    let right = Pos2::new(pb.x + 60.0, pb.y + 10.0);
+    h.drag_mods(pb, right, egui::Modifiers::SHIFT);
+    {
+        let s = h.app.session.as_ref().unwrap();
+        let (ti, ci) = s.find_clip(id).unwrap();
+        assert_eq!(ti, 0, "the clip stayed on its track");
+        let start = s.tracks[ti].clips[ci].start;
+        assert!(
+            (start - dt).abs() < 2.0 / rate,
+            "the clip moved right by the dragged time (want ~{dt}, got {start})"
+        );
+    }
+    // the same diagonal drag without Shift moves both ways, as before
+    h.frames(2);
+    let pc = body(&h);
+    let free = Pos2::new(
+        pc.x + 60.0,
+        pc.y + (rows[1].center().y - rows[0].center().y).abs(),
+    );
+    h.drag_mods(pc, free, egui::Modifiers::default());
+    {
+        let s = h.app.session.as_ref().unwrap();
+        let (ti, ci) = s.find_clip(id).unwrap();
+        let start = s.tracks[ti].clips[ci].start;
+        assert!(ti > 0, "the free drag changed the track too");
+        assert!(
+            start > dt * 0.5,
+            "the free drag changed the time too (got {start})"
+        );
+    }
+}
+
+/// Holding Shift while dragging a keyframe locks it to the main 8 directions as well: a
+/// mostly-upward drag changes only its value (the time stands still), while the same drag
+/// without Shift moves the keyframe diagonally as before.
+#[test]
+fn shift_dragging_a_keyframe_locks_it_to_the_axes() {
+    use crate::keys::EnvTarget;
+    let mut h = Harness::new(true, true);
+    h.app.tool = crate::app::Tool::Move;
+    h.frames(2);
+    let b = h.app.session.as_ref().unwrap().tracks[0].clips[0].id;
+    // the demo clip's own volume envelope has a keyframe at its left edge
+    let spot = h
+        .app
+        .multi_drag
+        .key_spots
+        .iter()
+        .find(|(t, i, _)| *t == EnvTarget::ClipVol(b) && *i == 0)
+        .map(|s| s.2)
+        .expect("clip B's first keyframe is drawn");
+    h.drag_mods(
+        spot,
+        Pos2::new(spot.x + 10.0, spot.y - 40.0),
+        egui::Modifiers::SHIFT,
+    );
+    {
+        let s = h.app.session.as_ref().unwrap();
+        let c = &s.tracks[0].clips[0];
+        let rate = s.rate as f64;
+        assert!(
+            c.env[0].0.abs() < 2.0 / rate,
+            "the keyframe's time did not move: {}",
+            c.env[0].0
+        );
+        assert!(
+            c.env[0].1 > 1.0,
+            "the keyframe's value moved up instead: {}",
+            c.env[0].1
+        );
+    }
+    // and the same drag without Shift is free: both the time and the value change
+    h.frames(2);
+    let spot = h
+        .app
+        .multi_drag
+        .key_spots
+        .iter()
+        .find(|(t, i, _)| *t == EnvTarget::ClipVol(b) && *i == 0)
+        .map(|s| s.2)
+        .expect("the keyframe is drawn again");
+    h.drag_mods(
+        spot,
+        Pos2::new(spot.x + 10.0, spot.y - 40.0),
+        egui::Modifiers::default(),
+    );
+    {
+        let s = h.app.session.as_ref().unwrap();
+        let c = &s.tracks[0].clips[0];
+        assert!(
+            c.env[0].0 > 0.02,
+            "the free drag moved the time: {}",
+            c.env[0].0
+        );
+        assert!(
+            c.env[0].1 > 1.0,
+            "the free drag moved the value: {}",
+            c.env[0].1
+        );
+    }
+}
+
+// ---- the person's multitrack tools scenario ---------------------------------
+
+fn tools_states(app: &App) -> Vec<(u8, bool)> {
+    let metro = app
+        .session
+        .as_ref()
+        .map(|s| s.metronome.on)
+        .unwrap_or(false);
+    vec![
+        (0, app.header_view == 0),
+        (1, app.header_view == 1),
+        (2, app.header_view == 2),
+        (3, app.header_view == 3),
+        (4, metro),
+        (5, app.stretch_mode),
+        (6, app.snapping),
+        (7, app.snap_menu_open),
+        (8, app.auto_scroll),
+    ]
+}
+
+/// The person's request: the Multitrack Tools back in the corner where they were, and however
+/// tall the tracks grow (3x) and wherever they scroll (to the bottom), the tracks must never
+/// make the tools' buttons unpressable. Every button answers after growing and scrolling, every
+/// button sits inside the corner panel, and the panel ends where the tracks begin.
+#[test]
+fn multitrack_tools_stay_clickable_when_tracks_grow_and_scroll() {
+    let mut h = Harness::new(true, true);
+    h.frames(3);
+    // first: every button answers with the tracks at their normal height
+    let before = tools_states(&h.app);
+    let spots = h.app.multi_drag.tool_spots.clone();
+    assert_eq!(spots.len(), 9, "nine tool buttons drawn");
+    for (i, (_, r)) in spots.iter().enumerate() {
+        h.click(r.center());
+        let after = tools_states(&h.app);
+        let changed = (0..9u8).any(|k| {
+            before.iter().find(|(j, _)| *j == k).unwrap().1
+                != after.iter().find(|(j, _)| *j == k).unwrap().1
+        });
+        println!(
+            "default pass button {i} ({}): changed={changed}",
+            r.center()
+        );
+    }
+    // grow the tracks 3x and scroll to the bottom, like the person did
+    {
+        let s = h.app.session.as_mut().unwrap();
+        for t in &mut s.tracks {
+            t.height = (t.height * 3.0).clamp(40.0, 600.0);
+        }
+    }
+    h.frames(3);
+    h.app.multi_drag.scroll_y = f32::MAX; // clamped to the bottom
+    h.frames(3);
+    println!("scroll_y after clamp: {}", h.app.multi_drag.scroll_y);
+    // now every button must still answer, and every button must sit in the corner panel,
+    // which ends where the tracks begin, so track rows can never run under it
+    let panel = h.app.multi_drag.tool_panel.expect("corner panel recorded");
+    let (lanes, _, _) = h.app.multi_drag.geom.clone().expect("layout");
+    assert!(
+        panel.bottom() <= lanes.top() + 0.5,
+        "the corner panel ({panel:?}) ends below the visible track area (top {})",
+        lanes.top()
+    );
+    let spots = h.app.multi_drag.tool_spots.clone();
+    assert_eq!(spots.len(), 9, "nine tool buttons still drawn");
+    for (i, (_, r)) in spots.iter().enumerate() {
+        assert!(
+            panel.contains_rect(*r),
+            "button {i} ({r:?}) is outside the corner panel ({panel:?})"
+        );
+        let before = tools_states(&h.app);
+        h.click(r.center());
+        let after = tools_states(&h.app);
+        let changed = (0..9u8).any(|k| {
+            before.iter().find(|(j, _)| *j == k).unwrap().1
+                != after.iter().find(|(j, _)| *j == k).unwrap().1
+        });
+        println!(
+            "scrolled pass button {i} ({}): changed={changed}",
+            r.center()
+        );
+        if !changed && i != 0 {
+            panic!(
+                "tools button {i} at {} did not answer after growing the tracks and scrolling to the bottom",
+                r.center()
+            );
+        }
+    }
+    // and one more pass with the snap-target panel open (the corner hangs over the tracks)
+    {
+        let (_, r) = spots.iter().find(|(k, _)| *k == 7).unwrap().clone();
+        h.click(r.center());
+    }
+    h.frames(3);
+    assert!(h.app.snap_menu_open, "the snap-target panel opened");
+    let spots = h.app.multi_drag.tool_spots.clone();
+    for (i, (_, r)) in spots.iter().enumerate() {
+        let before = tools_states(&h.app);
+        h.click(r.center());
+        let after = tools_states(&h.app);
+        let changed = (0..9u8).any(|k| {
+            before.iter().find(|(j, _)| *j == k).unwrap().1
+                != after.iter().find(|(j, _)| *j == k).unwrap().1
+        });
+        println!(
+            "menu-open pass button {i} ({}): changed={changed}",
+            r.center()
+        );
+        if !changed && !matches!(i, 0 | 7) {
+            panic!(
+                "tools button {i} at {} did not answer while the snap-target panel was open",
+                r.center()
+            );
+        }
+    }
+}
+
+// ---- the pre-render gauge -------------------------------------------------------
+
+fn prerender_on(h: &mut Harness, ti: usize) -> u64 {
+    let s = h.app.session.as_mut().unwrap();
+    s.tracks[ti].prerender = true;
+    s.touch();
+    s.tracks[ti].id
+}
+
+/// With room in the cache cap the whole session is pre-rendered, a little at a time (the gauge
+/// fills while the track still plays live), and playback then uses the rendered audio.
+#[test]
+fn prerender_fills_the_whole_session_when_it_fits_the_cap() {
+    use std::time::Duration;
+    let mut h = Harness::new(true, true);
+    h.frames(2);
+    assert!(h.app.prerender_gauge().is_none(), "no gauge without Pre-render");
+    assert!(h.app.multi_drag.prerender_bar.is_none());
+    let tid = prerender_on(&mut h, 0);
+    assert!(
+        h.app.prerender_tick(Duration::ZERO),
+        "a render started and has work left after one block"
+    );
+    let g0 = h.app.prerender_gauge().expect("gauge shown");
+    assert!(g0.busy && g0.progress < 0.5, "{g0:?}");
+    assert!(g0.window.0 < 1e-9 && g0.window.1 > 8.0, "the whole track: {g0:?}");
+    h.app.finish_prerenders();
+    let g = h.app.prerender_gauge().unwrap();
+    let c = &h.app.prerender[&tid];
+    assert!(!g.busy && g.progress > 0.999, "{g:?}");
+    assert!(c.start < 1e-9, "starts at the session start");
+    assert!(
+        (c.rendered_to() - c.end).abs() < 1e-6,
+        "rendered to the end: {} vs {}",
+        c.rendered_to(),
+        c.end
+    );
+    assert!(g.megabytes > 0.5 && g.megabytes < g.cap_megabytes, "{g:?}");
+    // playback plays the rendered stretch, and it sounds like the live track
+    let s = h.app.session.as_ref().unwrap();
+    let files = &h.app.files;
+    let pre = &h.app.prerender;
+    let look = |id: u64| files.iter().find(|f| f.id == id).map(|f| f.data.clone());
+    let with = s.snapshot_with(&look, &|t| pre.get(&t).map(|c| c.range()));
+    assert!(with.tracks[0].pre.is_some(), "the mix carries the render");
+    let live = s.snapshot(&look);
+    let a = crate::session::mixdown(&with, s.rate, 0.0, 3.0);
+    let b = crate::session::mixdown(&live, s.rate, 0.0, 3.0);
+    let diff = a.ch[0]
+        .iter()
+        .zip(&b.ch[0])
+        .fold(0.0f32, |m, (x, y)| m.max((x - y).abs()));
+    assert!(diff < 1e-3, "rendered playback matches live playback (diff {diff})");
+    // an edit drops the stale render at once
+    h.app.session.as_mut().unwrap().tracks[0].clips[0].gain_db -= 3.0;
+    h.app.update_prerenders();
+    assert!(!h.app.prerender.contains_key(&tid), "stale render forgotten");
+    // the bar is drawn on the ruler, and goes away with Pre-render off
+    h.frames(2);
+    assert!(h.app.multi_drag.prerender_bar.is_some(), "gauge drawn");
+    h.app.session.as_mut().unwrap().tracks[0].prerender = false;
+    h.frames(2);
+    assert!(h.app.prerender_gauge().is_none());
+    assert!(h.app.multi_drag.prerender_bar.is_none());
+    assert!(h.app.prerender.is_empty());
+}
+
+/// A small cache cap: the render follows the playhead, the set amount ahead and behind, drops
+/// what fell behind, and starts over where the playhead jumps to.
+#[test]
+fn prerender_follows_the_playhead_within_the_cap() {
+    let mut h = Harness::new(true, true);
+    h.frames(2);
+    h.app.prefs.prerender_cap_mb = 2.0; // about 5.5 s at 48 kHz: less than the track
+    h.app.prefs.prerender_ahead_s = 2.0;
+    h.app.prefs.prerender_behind_s = 1.0;
+    let tid = prerender_on(&mut h, 0);
+    h.app.session.as_mut().unwrap().cursor = 0.0;
+    h.app.finish_prerenders();
+    let c = &h.app.prerender[&tid];
+    assert!(c.start < 1e-9, "{}", c.start);
+    let ready = c.rendered_to();
+    assert!((2.0..2.5).contains(&ready), "2 s ahead of the playhead: {ready}");
+    // the playhead moves on inside the rendered stretch: more ahead, the old part trimmed
+    h.app.session.as_mut().unwrap().cursor = 2.0;
+    h.app.finish_prerenders();
+    let c = &h.app.prerender[&tid];
+    assert!(c.rendered_to() >= 4.0 - 1e-6, "{}", c.rendered_to());
+    assert!(c.start > 0.7 && c.start <= 1.0 + 1e-6, "trimmed to 1 s behind: {}", c.start);
+    // a jump far ahead starts over there
+    h.app.session.as_mut().unwrap().cursor = 6.0;
+    h.app.finish_prerenders();
+    let c = &h.app.prerender[&tid];
+    assert!((c.start - 5.0).abs() < 1e-3, "restarted 1 s behind: {}", c.start);
+    assert!(c.rendered_to() >= 8.0 - 1e-6, "{}", c.rendered_to());
+    let g = h.app.prerender_gauge().unwrap();
+    assert!(
+        g.megabytes <= g.cap_megabytes + 0.1,
+        "stays within the cap: {g:?}"
+    );
+    assert!((g.window.0 - 5.0).abs() < 1e-3, "{g:?}");
+}
+
+/// The render runs past the last clip until the effects have died away: a delay's echoes
+/// are pre-rendered, a dry track stops at its last clip.
+#[test]
+fn prerender_keeps_rendering_an_effect_tail() {
+    let mut h = Harness::new(true, true);
+    h.frames(2);
+    let (dry, wet) = {
+        let s = h.app.session.as_mut().unwrap();
+        s.tracks[1].rack = vec![crate::dsp::EffectSlot::new(crate::dsp::Effect::Delay {
+            time_ms: 300.0,
+            feedback: 0.6,
+            mix: 0.5,
+        })];
+        s.tracks[0].prerender = true;
+        s.tracks[1].prerender = true;
+        s.touch();
+        (s.tracks[0].id, s.tracks[1].id)
+    };
+    h.app.finish_prerenders();
+    let d = &h.app.prerender[&dry];
+    assert!(d.tail_done && (d.end - d.content_end).abs() < 0.2, "dry: {} vs {}", d.end, d.content_end);
+    let w = &h.app.prerender[&wet];
+    assert!(w.tail_done, "the tail was measured");
+    assert!(
+        w.end > w.content_end + 1.0,
+        "the echoes keep the render going: end {} after the clip end {}",
+        w.end,
+        w.content_end
+    );
+    assert!(
+        w.end < w.content_end + h.app.prefs.prerender_max_tail_s as f64 - 1.0,
+        "and it stops once they die away: {}",
+        w.end
+    );
+    assert!((w.rendered_to() - w.end).abs() < 1e-6);
+}
+
+/// A mixdown made in steps is the same as one made at once (the pre-render's renderer keeps
+/// its effect state between steps).
+#[test]
+fn stepped_mixdown_matches_a_whole_mixdown() {
+    let h = Harness::new(true, true);
+    let s = h.app.session.as_ref().unwrap();
+    let files = &h.app.files;
+    let mix = s.snapshot(&|id| files.iter().find(|f| f.id == id).map(|f| f.data.clone()));
+    let whole = crate::session::mixdown(&mix, s.rate, 0.0, 2.0);
+    let mut r = crate::session::MixRender::new(&mix, s.rate, 0.0, 2.0);
+    let mut steps = 0;
+    while !r.step(&mix, 1) {
+        steps += 1;
+    }
+    assert!(steps > 3, "rendered in several steps");
+    let stepped = r.finish();
+    assert_eq!(whole.ch[0].len(), stepped.ch[0].len());
+    assert_eq!(whole.ch[0], stepped.ch[0]);
+    assert_eq!(whole.ch[1], stepped.ch[1]);
+}
+
+/// The person's request: a clip's edge snaps to the other clips' edges on the tracks above and
+/// below too. Trimming the melody's end (track 1) near a beat clip's end (track 2) lands
+/// exactly on it, holds there while the drag goes on, and only with Snapping off stays where
+/// the pointer let go.
+#[test]
+fn a_trimmed_clip_edge_snaps_to_clips_on_other_tracks() {
+    for snapping in [true, false] {
+        let mut h = Harness::new(true, true);
+        h.app.tool = crate::app::Tool::Move;
+        h.app.snapping = snapping;
+        // clip edges only, so nothing else can explain the landing spot
+        h.app.prefs.snap_time_display = false;
+        h.app.prefs.snap_playhead = false;
+        h.app.prefs.snap_session_start = false;
+        h.app.prefs.marker_snap = false;
+        h.frames(2);
+        let (mel, target) = {
+            let s = h.app.session.as_ref().unwrap();
+            (s.tracks[0].clips[0].id, s.tracks[1].clips[1].end())
+        };
+        let (rect, rows, view) = h.app.multi_drag.geom.clone().expect("layout");
+        let x_of = |t: f64| rect.left() + ((t - view.0) / (view.1 - view.0)) as f32 * rect.width();
+        let end0 = {
+            let s = h.app.session.as_ref().unwrap();
+            let (ti, ci) = s.find_clip(mel).unwrap();
+            s.tracks[ti].clips[ci].end()
+        };
+        assert!(end0 > target + 0.3, "the melody ends after the beat: {end0} vs {target}");
+        let from = Pos2::new(x_of(end0) - 2.0, rows[0].center().y + 20.0);
+        let to = Pos2::new(x_of(target) + 3.0, from.y);
+        // a person's drag: real time, the pointer slowing to a stop near the target
+        h.clock = Some(0.0);
+        let press = |pos: Pos2, pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        h.frames_with(1, vec![egui::Event::PointerMoved(from), press(from, true)]);
+        let steps = 40;
+        for k in 1..=steps {
+            let f = k as f32 / steps as f32;
+            let f = 1.0 - (1.0 - f) * (1.0 - f); // ease out
+            let p = from + (to - from) * f;
+            h.frames_with(1, vec![egui::Event::PointerMoved(p)]);
+        }
+        h.frames_with(20, vec![]); // the hand rests before letting go
+        h.frames_with(2, vec![press(to, false)]);
+        let s = h.app.session.as_ref().unwrap();
+        let (ti, ci) = s.find_clip(mel).unwrap();
+        let end = s.tracks[ti].clips[ci].end();
+        assert!(end < end0 - 0.2, "the edge was trimmed: {end0} -> {end}");
+        if snapping {
+            assert!(
+                (end - target).abs() < 1e-6,
+                "snapped to the clip end on the track below: {end} vs {target}"
+            );
+        } else {
+            assert!(
+                (end - target).abs() > 1e-3,
+                "Snapping off leaves the edge where it was dropped: {end}"
+            );
+        }
+    }
 }

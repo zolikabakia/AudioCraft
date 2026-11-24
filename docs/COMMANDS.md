@@ -3,7 +3,6 @@
 Every feature is a command with a stable ID. Run commands from the menus, from the keyboard, from the Command Palette (Ctrl+Shift+P), or list them with `audiocraft --list-commands`. This file is generated from that output.
 
 | ID | Title | Shortcut | What it does |
-|---|---|---|---|
 | `file.new` | New Audio File | Ctrl+N | Create an empty audio file (asks for sample rate, channels and bit depth). |
 | `file.new_session` | New Multitrack Session | Ctrl+Shift+N | Create an empty multitrack session. |
 | `file.open` | Open | Ctrl+O | Open a session or AudioCraft project first; audio files and videos are also available. |
@@ -23,7 +22,8 @@ Every feature is a command with a stable ID. Run commands from the menus, from t
 | `edit.paste` | Paste | Ctrl+V | Insert the clipboard at the playhead (replaces the selection). |
 | `edit.mix_paste` | Mix Paste | Ctrl+Shift+V | Mix the clipboard over the audio at the playhead. |
 | `edit.paste_new` | Paste to New File | Ctrl+Alt+V | Create a new file from the clipboard. |
-| `edit.delete` | Delete | Del | Delete the selection, or the selected clip in Multitrack. |
+| `edit.delete` | Delete | Del | Delete the selection. In Multitrack every selected clip goes and the space it occupied stays; selected empty space closes up instead (there is nothing in it to remove). |
+| `edit.ripple_delete` | Ripple Delete | Shift+Del | Delete the selected clips and close the gap they leave: the later clips of their track pull left. Selected empty space closes the same way, whichever key pressed it. |
 | `edit.crop` | Crop | Ctrl+T | Keep only the selection. |
 | `edit.select_all` | Select All | Ctrl+A | Select the whole file or session. |
 | `edit.deselect` | Deselect All | Ctrl+Shift+A | Clear the selection. |
@@ -85,7 +85,8 @@ Every feature is a command with a stable ID. Run commands from the menus, from t
 | `spectral.select_all` | Select All Frequencies |  | Select the whole time and frequency range of the spectral display. |
 | `view.toggle_metronome` | Toggle Metronome |  | Show or hide the metronome row in Multitrack (its clicks play with the session). |
 | `view.toggle_clip_stretch` | Toggle Global Clip Stretching |  | Show stretch handles on every clip's top corners; drag them to change a clip's length (the % shows the new length). |
-| `view.toggle_snapping` | Toggle Snapping |  | Snap clips, drops and the playhead to clip edges, the playhead and the session start. |
+| `view.toggle_snapping` | Toggle Snapping |  | Snap clips, drops and the playhead to the chosen targets: clip starts and ends, markers, the ruler's time marks, the playhead and the session start (the magnet's menu in the Multitrack Tools corner picks them). |
+| `view.multitrack_tools` | Multitrack Tools |  | Show or hide the Multitrack Tools in the multitrack view's corner (header views, metronome, stretching, snapping with its targets, auto-scroll). |
 | `view.toggle_auto_scroll` | Toggle Playback Auto-Scroll |  | Keep the playhead in view while playing. |
 | `view.theme_toggle` | Next Colour Theme |  | Switch to the next colour theme (AudioCraft, Audition Dark, then the PhotoCraft and VectorCraft themes). |
 | `view.track_header_io` | Track Headers: Inputs/Outputs |  | Show each track's input and output in its header. |
@@ -218,7 +219,7 @@ Every feature is a command with a stable ID. Run commands from the menus, from t
 | `edit.select_to_start` | Select Playhead to Start | Shift+Home | Select from the start to the playhead. |
 | `edit.select_to_end` | Select Playhead to End | Shift+End | Select from the playhead to the end. |
 | `edit.select_track_clips` | Select All Clips in Selected Track |  | Select every clip of the selected track. |
-| `edit.ripple_delete_clips` | Ripple Delete: Selected Clips |  | Delete the selected clips and pull the later clips of their tracks left to close the gap. |
+| `edit.ripple_delete_clips` | Ripple Delete: Selected Clips |  | Delete the selected clips and pull the later clips of their tracks left to close the gap. Picked empty space closes the same way (this is also what Shift+Delete does). |
 | `edit.ripple_delete_time` | Ripple Delete: Time Selection in All Tracks |  | Cut the time selection out of every track and pull everything after it left. |
 | `edit.zero_cross_in` | Zero Crossings: Adjust Selection Inward |  | Move both ends of the selection inward to the nearest zero crossing (clean cuts without clicks). |
 | `edit.zero_cross_out` | Zero Crossings: Adjust Selection Outward |  | Move both ends of the selection outward to the nearest zero crossing. |
@@ -253,11 +254,6 @@ Every feature is a command with a stable ID. Run commands from the menus, from t
 | `transport.record_ready` | Record (Ready) | Shift+Space | Get recording ready on the armed tracks (or the open file); recording starts when you press Play. Pressing it while playing punches in at once. |
 | `video.decoders` | Video Decoders... |  | Choose which installed video decoder is used, or download a free one (Edit > Preferences > Video). |
 | `video.convert_color` | Convert Video Preview to Rec.709 |  | Re-decode the video's preview frames converted from wide-gamut / HDR colour to standard Rec.709. |
-
-## More menus (clipboards, metronome, clip gain)
-
-| ID | Title | Shortcut | What it does |
-|---|---|---|---|
 | `edit.clipboard_1` | Set Current Clipboard 1 |  | Use clipboard 1 for Cut, Copy and Paste (each of the five clipboards keeps its own audio). |
 | `edit.clipboard_2` | Set Current Clipboard 2 |  | Use clipboard 2 for Cut, Copy and Paste. |
 | `edit.clipboard_3` | Set Current Clipboard 3 |  | Use clipboard 3 for Cut, Copy and Paste. |
@@ -273,11 +269,12 @@ Every feature is a command with a stable ID. Run commands from the menus, from t
 | `clip.gain_down` | Clip Gain -1 dB |  | Lower the selected clips' gain by 1 dB. |
 | `clip.gain_reset` | Reset Clip Gain |  | Set the selected clips' gain back to 0 dB. |
 | `clip.bring_front` | Bring Clip to Front |  | Draw and play the selected clip on top of clips it overlaps on its track. |
-| `clip.fade_in_remove` | Remove Fade In |  | Take the fade-in off the selected clips. |
-| `clip.fade_out_remove` | Remove Fade Out |  | Take the fade-out off the selected clips. |
 | `clip.group` | Group Clips |  | Group the selected clips: they then select, move and delete together. |
 | `clip.ungroup` | Ungroup Clips |  | Take the selected clips out of their group. |
 | `tracks.show_all` | Show All Tracks |  | Show every track in the Editor (Tracks panel). |
 | `tracks.hide_all` | Hide All Tracks |  | Hide every track from the Editor; hidden tracks still play. |
 | `tracks.only_selected` | Show Only Selected Track |  | Hide every track except the selected one. |
 | `tracks.hide_empty` | Hide Empty Tracks |  | Hide tracks that hold no clips. |
+| `clip.fade_in_remove` | Remove Fade In |  | Take the fade-in off the selected clips. |
+| `clip.fade_out_remove` | Remove Fade Out |  | Take the fade-out off the selected clips. |
+

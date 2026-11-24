@@ -8,6 +8,10 @@ use crate::theme::{self, Icon};
 use crate::workspace::{Group, Layout, PanelId};
 use egui::{Color32, FontId, Frame, Margin, Rect, RichText, Sense, Stroke, pos2, vec2};
 
+/// The smallest bottom-row height that still shows all of Selection/View (its tab, the time
+/// format dropdown and the Start/End/Duration rows): the row's resize stopper.
+pub const SELECTION_VIEW_MIN_H: f32 = 116.0;
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Region {
     Left,
@@ -174,10 +178,21 @@ impl App {
             p.show(ui, |ui| self.dock_column(ui, Region::Right));
         }
         if !lay.bottom.is_empty() {
+            // a stopper: with Selection/View in the bottom row, the row can't be dragged
+            // smaller than that panel's format dropdown and its two rows of times
+            let min_b = if lay
+                .bottom
+                .iter()
+                .any(|g| g.tabs.contains(&crate::workspace::PanelId::SelectionView))
+            {
+                SELECTION_VIEW_MIN_H
+            } else {
+                60.0
+            };
             egui::Panel::bottom(egui::Id::new(("ws_b", &key)))
                 .resizable(true)
-                .default_size(lay.bottom_h)
-                .size_range(60.0..=700.0)
+                .default_size(lay.bottom_h.max(min_b))
+                .size_range(min_b..=700.0)
                 .frame(fill)
                 .show(ui, |ui| self.dock_row(ui, Region::Bottom));
         }

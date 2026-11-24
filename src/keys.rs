@@ -3,7 +3,8 @@
 //!
 //! Each keyframe is its own small widget on top of the timeline: it lights up under the pointer,
 //! a click selects it (Shift/Ctrl adds to the selection), a drag moves it (with the other
-//! selected keyframes of the same envelope), a double-click or Delete removes it.
+//! selected keyframes of the same envelope; Shift locks the move to the main 8 directions),
+//! a double-click or Delete removes it.
 //!
 //! With the Direct Selection tool (the white arrow, A) keyframes also show their Bezier handles:
 //! drag a handle to bend the curve (the opposite handle turns with it), Alt+drag a handle to
@@ -14,6 +15,31 @@ use crate::app::{App, Tool};
 use crate::curves::{self, Handles, Side};
 use crate::session::Session;
 use egui::{Color32, Pos2, Rect, Sense, Stroke, pos2, vec2};
+
+/// Lock a drag to the main 8 directions (multiples of 45°), the way drawing apps do: the
+/// pointer's travel from where the grab started (`origin`) is projected onto the nearest of
+/// the eight, so a mostly-upward drag moves straight up, a mostly-rightward one straight
+/// right, and a diagonal one exactly along the diagonal. Returns `p` unchanged when the
+/// pointer has barely moved or the numbers went odd.
+pub fn snap_dir8(origin: Pos2, p: Pos2) -> Pos2 {
+    let d = p - origin;
+    let len = d.length();
+    if !len.is_finite() || len < 1e-3 {
+        return p;
+    }
+    let step = std::f32::consts::FRAC_PI_2 * 0.5; // 45°
+    let k = (d.y.atan2(d.x) / step).round();
+    let (s, c) = (k * step).sin_cos();
+    if !c.is_finite() || !s.is_finite() {
+        return p;
+    }
+    // how far the drag reaches along the chosen direction
+    let along = d.x * c + d.y * s;
+    if !along.is_finite() {
+        return p;
+    }
+    origin + vec2(c, s) * along
+}
 
 /// Which envelope a keyframe belongs to (clips and tracks by id, so it survives reordering).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -522,6 +548,13 @@ impl App {
                             ) = (r.interact_pointer_pos(), self.multi_drag.key_drag.clone())
                             {
                                 if target == v.target && idx == i {
+                                    // Shift keeps the handle on one of the main 8 directions
+                                    // through its own keyframe (45° steps, like a drawing app)
+                                    let pp = if ui.input(|i| i.modifiers.shift) {
+                                        snap_dir8(c, pp)
+                                    } else {
+                                        pp
+                                    };
                                     self.move_handle(v, idx, side, alone, pp);
                                 }
                             }
@@ -558,7 +591,7 @@ impl App {
                         )
                     } else {
                         format!(
-                            "{} keyframe: {unit}\nClick to select, drag to move, double-click or Delete to remove, right-click for interpolation",
+                            "{} keyframe: {unit}\nClick to select, drag to move (Shift locks it to the 8 main directions), double-click or Delete to remove, right-click for interpolation",
                             v.target.label()
                         )
                     };
@@ -656,7 +689,7 @@ impl App {
                     self.select_owner(v.target);
                 }
                 if r.dragged() {
-                    if let Some(pp) = r.interact_pointer_pos() {
+                    if let Some(pp0) = r.interact_pointer_pos() {
                         match self.multi_drag.key_drag.clone() {
                             Some(KeyDrag::Keys {
                                 target,
@@ -664,11 +697,25 @@ impl App {
                                 start,
                                 origin,
                             }) if target == v.target && grab == i => {
+                                // Shift locks the move to the main 8 directions from where the
+                                // grab started, so a mostly-upward drag moves the keyframe
+                                // straight up and a mostly-rightward one straight right
+                                let pp = if ui.input(|i| i.modifiers.shift) {
+                                    snap_dir8(origin, pp0)
+                                } else {
+                                    pp0
+                                };
                                 self.move_keys(v, &start, grab, origin, pp);
                             }
                             Some(KeyDrag::Pull { target, idx })
                                 if target == v.target && idx == i =>
                             {
+                                // Shift keeps the pulled handle on one of the main 8 directions
+                                let pp = if ui.input(|i| i.modifiers.shift) {
+                                    snap_dir8(c, pp0)
+                                } else {
+                                    pp0
+                                };
                                 self.pull_handles(v, idx, pp);
                             }
                             _ => {}

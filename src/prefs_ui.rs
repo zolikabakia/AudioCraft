@@ -749,9 +749,68 @@ impl App {
                     "Automation lane height",
                     " px",
                 );
+                slider(
+                    ui,
+                    &mut p.snapping_distance_px,
+                    defaults().snapping_distance_px,
+                    0.0..=100.0,
+                    "Snapping distance",
+                    " px",
+                );
+                note(
+                    ui,
+                    "How far apart two clips have to be before a drag with Snapping on snaps them together.",
+                );
+                section(ui, "Snapping targets");
+                ui.checkbox(
+                    &mut p.snap_time_display,
+                    "Time display (the ruler's labelled marks)",
+                );
+                ui.checkbox(&mut p.snap_clip_starts, "Clip starts");
+                ui.checkbox(&mut p.snap_clip_ends, "Clip ends");
+                ui.checkbox(&mut p.marker_snap, "Markers");
+                ui.checkbox(&mut p.snap_playhead, "Playhead");
+                ui.checkbox(&mut p.snap_session_start, "Session start (0:00)");
+                section(ui, "Pre-render");
                 ui.checkbox(
                     &mut p.pre_render_tracks,
                     "Pre-render track effects by default",
+                );
+                slider(
+                    ui,
+                    &mut p.prerender_cap_mb,
+                    defaults().prerender_cap_mb,
+                    16.0..=16384.0,
+                    "Pre-render cache cap",
+                    " MB",
+                );
+                slider(
+                    ui,
+                    &mut p.prerender_ahead_s,
+                    defaults().prerender_ahead_s,
+                    1.0..=600.0,
+                    "Render ahead of the playhead",
+                    " s",
+                );
+                slider(
+                    ui,
+                    &mut p.prerender_behind_s,
+                    defaults().prerender_behind_s,
+                    0.0..=600.0,
+                    "Keep behind the playhead",
+                    " s",
+                );
+                slider(
+                    ui,
+                    &mut p.prerender_max_tail_s,
+                    defaults().prerender_max_tail_s,
+                    0.0..=120.0,
+                    "Longest effect tail",
+                    " s",
+                );
+                note(
+                    ui,
+                    "Pre-rendered tracks share the cache cap. When a track's whole render fits its share, the whole session is rendered; otherwise the render follows the playhead, this far ahead and behind. Each render continues past the last clip until its effects (a reverb tail) have died away, up to the longest tail.",
                 );
                 section(ui, "Audition compatibility (.sesx)");
                 ui.checkbox(

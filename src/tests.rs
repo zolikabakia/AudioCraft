@@ -1044,6 +1044,7 @@ fn master_automation_changes_within_one_block() {
             vol: 1.0,
             polarity: 1.0,
             extra: Default::default(),
+            pre: None,
         }],
         master: 1.0,
         master_env: vec![(0.0, 0.0), (0.1, -60.0)],
@@ -1343,34 +1344,278 @@ fn clip_edge_zones_reach_visible_boundary_when_scrolled() {
 }
 
 #[test]
-fn clip_selection_ranges_and_toggles() {
-    let mut s = Session::new("sel", 48000, 1);
+fn clip_and_gap_selection_follow_the_row_clicks() {
+    let mut s = Session::new("sel", 48000, 2);
     let mut ids: Vec<u64> = vec![];
-    for _ in 0..5 {
+    // five clips on track 0, each one second long with a gap after it
+    for i in 0..5 {
         let id = s.id();
-        s.tracks[0].clips.push(dc_clip(id, 1.0));
+        let mut c = dc_clip(id, 0.6);
+        c.start = i as f64;
+        s.tracks[0].clips.push(c);
         ids.push(id);
     }
-    // a plain click selects one clip
-    s.select_clips(ids[2], false, false);
+    // a plain click selects one clip and drops the selected empty spans
+    s.select_clips(ids[2], false);
     assert_eq!(s.selected_clips, vec![ids[2]]);
     assert_eq!(s.selected_clip, Some(ids[2]));
-    // Shift+click from the last selection selects the range between, in order
-    s.select_clips(ids[4], true, false);
-    assert_eq!(s.selected_clips, vec![ids[2], ids[3], ids[4]]);
-    s.select_clips(ids[0], true, false);
+    // Ctrl+click toggles clips one by one: each grab joins the set, and picking a
+    // selected clip again drops it
+    s.select_clips(ids[0], true);
+    assert_eq!(s.selected_clips, vec![ids[2], ids[0]]);
+    assert_eq!(s.selected_clip, Some(ids[0]));
+    s.select_clips(ids[2], true);
+    assert_eq!(s.selected_clips, vec![ids[0]]);
+    // Shift+click selects every clip in the clicked clip's row (what is picked stays)
+    s.select_row_clips(ids[4]);
+    assert_eq!(s.selected_clips.len(), 5, "the whole row is selected");
+    assert!(ids.iter().all(|id| s.selected_clips.contains(id)));
     assert_eq!(
-        s.selected_clips,
-        vec![ids[0], ids[1], ids[2], ids[3], ids[4]]
+        s.selected_clip,
+        Some(ids[4]),
+        "the clip clicked is the active one"
     );
-    // Ctrl+click toggles individual clips in the set
-    s.select_clips(ids[1], false, true);
-    assert_eq!(s.selected_clips, vec![ids[0], ids[2], ids[3], ids[4]]);
-    s.select_clips(ids[2], false, true);
-    assert_eq!(s.selected_clips, vec![ids[0], ids[3], ids[4]]);
-    // clicking empty ground clears the set
+    // Shift+click on an already-picked clip drops that clip (the person's rule: it
+    // un-picks what is already selected) and the active role hands over
+    s.select_row_clips(ids[4]);
+    assert_eq!(s.selected_clips.len(), 4, "the picked clip leaves the set");
+    assert!(!s.selected_clips.contains(&ids[4]));
+    assert_eq!(s.selected_clip, Some(ids[3]), "the active role hands over");
+    // a clip outside the set brings its row back in
+    s.select_row_clips(ids[4]);
+    assert_eq!(s.selected_clips.len(), 5);
+    assert_eq!(s.selected_clip, Some(ids[4]));
+
+    // the empty spans of track 0: between each pair of clips, and the open end
+    let gaps = s.gaps_on(0);
+    assert_eq!(
+        gaps,
+        vec![
+            (0.6, 1.0),
+            (1.6, 2.0),
+            (2.6, 3.0),
+            (3.6, 4.0),
+            (4.6, f64::INFINITY)
+        ]
+    );
+    // a track without clips is one span from 0 on
+    assert_eq!(s.gaps_on(1), vec![(0.0, f64::INFINITY)]);
+    // Shift+click on empty space selects every span of that row
+    s.select_row_gaps(0, 1.8);
+    assert_eq!(s.selected_gaps.len(), 5);
+    assert_eq!(s.selected_gaps[0].a, 0.6);
+    assert!(s.selected_gaps.iter().all(|g| g.trk == s.tracks[0].id));
+    // Shift+click on an already-picked span drops that one span
+    s.select_row_gaps(0, 1.8);
+    assert_eq!(s.selected_gaps.len(), 4, "the span clicked leaves the set");
+    assert!(!s.selected_gaps.iter().any(|g| g.a == 1.6));
+    s.select_row_gaps(0, 1.8);
+    assert_eq!(
+        s.selected_gaps.len(),
+        5,
+        "an unpicked span brings the row back"
+    );
+    // Ctrl+click toggles the one span clicked, in and out
+    s.toggle_gap(0, 1.8);
+    assert_eq!(s.selected_gaps.len(), 4, "the span (1.6, 2.0) left the set");
+    assert!(!s.selected_gaps.iter().any(|g| g.a == 1.6));
+    s.toggle_gap(0, 1.8);
+    assert_eq!(s.selected_gaps.len(), 5, "the same click brings it back");
+    // the open end belongs to the last span, wherever it is clicked
+    s.toggle_gap(0, 99.0);
+    assert_eq!(s.selected_gaps.len(), 4, "the open end toggles too");
+    // clicking empty ground clears clips and spans together
     s.clear_selected_clips();
-    assert!(s.selected_clips.is_empty() && s.selected_clip.is_none());
+    assert!(s.selected_clips.is_empty() && s.selected_clip.is_none() && s.selected_gaps.is_empty());
+    // a plain click on a clip also drops the spans; a Ctrl+click keeps them
+    s.select_row_gaps(0, 1.8);
+    s.select_clips(ids[1], false);
+    assert!(s.selected_gaps.is_empty(), "a plain click resets the spans");
+    s.select_row_gaps(1, 0.5);
+    s.select_clips(ids[1], true);
+    assert_eq!(
+        s.selected_gaps.len(),
+        1,
+        "Ctrl+click leaves the spans alone"
+    );
+
+    // overlapping clips leave no span between them
+    let mut s2 = Session::new("ov", 48000, 1);
+    let mut a = dc_clip(s2.id(), 2.0);
+    a.start = 0.0;
+    let mut b = dc_clip(s2.id(), 2.0);
+    b.start = 1.0;
+    s2.tracks[0].clips = vec![a, b];
+    assert_eq!(s2.gaps_on(0), vec![(3.0, f64::INFINITY)]);
+}
+
+/// The person's delete rules: Delete / Backspace removes every picked clip and leaves
+/// the space it occupied; Shift+Delete / Shift+Backspace ripples, closing the gap so the
+/// later clips of the track pull left; and picked empty space closes up whichever key
+/// pressed it, because empty ground has no content to remove.
+#[test]
+fn delete_plain_and_ripple_and_picked_space() {
+    use crate::filecmds::{delete_clips_plain, ripple_delete_clips, ripple_delete_gaps};
+    use crate::session::GapSel;
+
+    // three clips on one track: 0..1, 2..3, 4..5
+    let row = |s: &mut Session| -> Vec<u64> {
+        let mut ids = vec![];
+        for st in [0.0, 2.0, 4.0] {
+            let id = s.id();
+            let mut c = dc_clip(id, 1.0);
+            c.start = st;
+            s.tracks[0].clips.push(c);
+            ids.push(id);
+        }
+        ids
+    };
+    let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+
+    // plain delete: the picked clips go, the space they occupied stays
+    let mut s = Session::new("plain", 48000, 1);
+    let ids = row(&mut s);
+    assert_eq!(delete_clips_plain(&mut s, &[ids[0], ids[2]]), 2);
+    assert_eq!(s.tracks[0].clips.len(), 1);
+    assert!(
+        near(s.tracks[0].clips[0].start, 2.0),
+        "the middle clip did not move: the space stays"
+    );
+    assert!(s.selected_clips.is_empty() && s.selected_clip.is_none() && s.selected_gaps.is_empty());
+
+    // ripple delete: the picked clip goes and the later clips of the track pull left
+    let mut s = Session::new("rip", 48000, 1);
+    let ids = row(&mut s);
+    assert_eq!(ripple_delete_clips(&mut s, &[ids[1]]), 1);
+    assert_eq!(s.tracks[0].clips.len(), 2);
+    assert!(near(s.tracks[0].clips[0].start, 0.0));
+    assert!(
+        near(s.tracks[0].clips[1].start, 3.0),
+        "the last clip pulled left into the closed gap"
+    );
+
+    // picked empty space closes: the span 1..2 between the first two clips
+    let mut s = Session::new("gap", 48000, 1);
+    row(&mut s);
+    let trk = s.tracks[0].id;
+    assert_eq!(
+        ripple_delete_gaps(
+            &mut s,
+            &[GapSel {
+                trk,
+                a: 1.0,
+                b: 2.0
+            }]
+        ),
+        1
+    );
+    assert!(near(s.tracks[0].clips[0].start, 0.0));
+    assert!(
+        near(s.tracks[0].clips[1].start, 1.0),
+        "the middle clip pulled next to the first"
+    );
+    assert!(
+        near(s.tracks[0].clips[2].start, 3.0),
+        "and the last clip with it"
+    );
+    assert!(s.selected_gaps.is_empty(), "the span selection is spent");
+
+    // the open tail span has no end to pull to: nothing happens
+    let mut s = Session::new("tail", 48000, 1);
+    row(&mut s);
+    let tail = GapSel {
+        trk: s.tracks[0].id,
+        a: 5.0,
+        b: f64::INFINITY,
+    };
+    assert_eq!(ripple_delete_gaps(&mut s, &[tail]), 0);
+    assert_eq!(s.tracks[0].clips.len(), 3, "the clips stay");
+    assert!(!s.dirty, "nothing changed, so the session is not touched");
+
+    // two picked spans on one track: both close, each later clip pulls left by both
+    let mut s = Session::new("two", 48000, 1);
+    row(&mut s);
+    let trk = s.tracks[0].id;
+    assert_eq!(
+        ripple_delete_gaps(
+            &mut s,
+            &[
+                GapSel {
+                    trk,
+                    a: 1.0,
+                    b: 2.0
+                },
+                GapSel {
+                    trk,
+                    a: 3.0,
+                    b: 4.0
+                }
+            ]
+        ),
+        2
+    );
+    assert!(
+        near(s.tracks[0].clips[1].start, 1.0),
+        "the first gap closed first"
+    );
+    assert!(
+        near(s.tracks[0].clips[2].start, 2.0),
+        "then the second: the last clip sits right after the middle one"
+    );
+
+    // a clip that moved into a picked span is cut by it, like Ripple Delete in time
+    let mut s = Session::new("moved", 48000, 1);
+    let ids = row(&mut s);
+    if let Some(c) = s.clip_mut(ids[1]) {
+        c.start = 1.5;
+    }
+    let span = GapSel {
+        trk: s.tracks[0].id,
+        a: 1.0,
+        b: 2.0,
+    };
+    assert_eq!(ripple_delete_gaps(&mut s, &[span]), 1);
+    assert_eq!(
+        s.tracks[0].clips.len(),
+        3,
+        "the straddling clip is cut, not lost"
+    );
+    let m = &s.tracks[0].clips[1];
+    assert!(near(m.start, 1.0), "the part inside the span went");
+    assert!(near(m.len, 0.5), "the part after it stayed and pulled left");
+    assert!(near(s.tracks[0].clips[2].start, 3.0), "the last clip too");
+}
+
+#[test]
+fn snap_dir8_locks_the_eight_main_directions() {
+    use crate::keys::snap_dir8;
+    use egui::{Pos2, pos2};
+    let o = pos2(100.0, 100.0);
+    let near = |a: Pos2, b: Pos2| (a.x - b.x).abs() < 1e-3 && (a.y - b.y).abs() < 1e-3;
+    // straight up and straight right stay where they are
+    assert!(near(snap_dir8(o, pos2(100.0, 40.0)), pos2(100.0, 40.0)));
+    assert!(near(snap_dir8(o, pos2(160.0, 100.0)), pos2(160.0, 100.0)));
+    // a nearly-upward drag (11° off the vertical) moves straight up, same distance
+    assert!(near(snap_dir8(o, pos2(112.0, 40.0)), pos2(100.0, 40.0)));
+    // a slightly-downward, mostly-right drag keeps only its rightward part
+    assert!(near(snap_dir8(o, pos2(160.0, 104.0)), pos2(160.0, 100.0)));
+    // the exact diagonal (45°) is already one of the eight
+    assert!(near(snap_dir8(o, pos2(160.0, 40.0)), pos2(160.0, 40.0)));
+    // 50° off the horizontal snaps to the 45° diagonal, keeping the distance travelled
+    // (40, -48) has angle -50.2°: nearest is -45°, and the projection lands at (44, -44)
+    let p = snap_dir8(o, pos2(140.0, 52.0));
+    assert!(
+        near(p, pos2(144.0, 56.0)),
+        "the drag snaps onto the 45° line at its own length: {p:?}"
+    );
+    // left and down: the diagonal towards the lower left
+    let p = snap_dir8(o, pos2(80.0, 130.0));
+    assert!(near(p, pos2(75.0, 125.0)), "{p:?}");
+    // a tiny movement still locks to the nearest direction: (0.2, -0.1) is 27° from
+    // horizontal, closer to the 45° diagonal, and lands on it at its own length
+    assert!(near(snap_dir8(o, pos2(100.2, 99.9)), pos2(100.15, 99.85)));
+    // no movement at all: the position is handed back untouched
+    assert_eq!(snap_dir8(o, o), o);
 }
 
 #[test]
@@ -2335,4 +2580,77 @@ fn print_effects_that_restart_when_automated() {
             println!("restarts: {}", e.name());
         }
     }
+}
+
+#[test]
+fn snap_targets_follow_their_settings() {
+    use crate::prefs::Prefs;
+    use crate::ui_multi::collect_snap_targets;
+
+    let mut s = Session::new("T", 48000, 1);
+    s.tracks[0].clips.push(Clip {
+        id: 1,
+        file_id: 0,
+        name: "c".into(),
+        start: 1.25,
+        offset: 0.0,
+        len: 2.0,
+        gain_db: 0.0,
+        muted: false,
+        env: vec![],
+        pan_env: vec![],
+        rack: vec![],
+        speed: 1.0,
+        fx: Default::default(),
+        auto_in: true,
+        auto_out: true,
+        curves: Default::default(),
+        fade_in: 0.0,
+        fade_out: 0.0,
+    });
+    s.markers.push(crate::session::Marker {
+        name: "m".into(),
+        time: 0.75,
+        duration: 0.0,
+    });
+    let view = (0.0, 30.0);
+    // everything on: the session start, the playhead, the clip's edges, the marker and the
+    // ruler's labelled marks are all targets (major step is 5 s at this zoom)
+    let pts = collect_snap_targets(&s, &Prefs::default(), 3.5, 30.0, 1000.0, view);
+    assert!(pts.contains(&0.0), "session start missing");
+    assert!(pts.contains(&3.5), "playhead missing");
+    assert!(pts.contains(&1.25), "clip start missing");
+    assert!(pts.contains(&3.25), "clip end missing");
+    assert!(pts.contains(&0.75), "marker missing");
+    assert!(pts.contains(&5.0), "time display mark missing");
+    // each target can be turned off on its own
+    let mut p = Prefs::default();
+    p.snap_session_start = false;
+    p.snap_playhead = false;
+    p.snap_clip_ends = false;
+    p.snap_clip_starts = false;
+    p.marker_snap = false;
+    let pts = collect_snap_targets(&s, &p, 3.5, 30.0, 1000.0, view);
+    assert!(!pts.contains(&3.5), "playhead should be off");
+    assert!(!pts.contains(&1.25), "clip start should be off");
+    assert!(!pts.contains(&3.25), "clip end should be off");
+    assert!(!pts.contains(&0.75), "marker should be off");
+    assert!(
+        pts.iter().filter(|t| **t != 0.0).count() > 0,
+        "time display marks stay on"
+    );
+    p.snap_time_display = false;
+    assert!(
+        collect_snap_targets(&s, &p, 3.5, 30.0, 1000.0, view).is_empty(),
+        "every target off leaves nothing to snap to"
+    );
+    // with only the clip's ends on, ends are targets and starts are not
+    let mut p = Prefs::default();
+    p.snap_session_start = false;
+    p.snap_playhead = false;
+    p.snap_clip_starts = false;
+    p.snap_time_display = false;
+    p.marker_snap = false;
+    let pts = collect_snap_targets(&s, &p, 3.5, 30.0, 1000.0, view);
+    assert!(pts.contains(&3.25) && !pts.contains(&1.25));
 }

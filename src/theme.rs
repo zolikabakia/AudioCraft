@@ -17,6 +17,10 @@ pub struct Palette {
     pub zero_line: Color32,
     pub wave_sel_bg: Color32,
     pub playhead: Color32,
+    /// The snapping indicator line: the theme's contrast colour for it — a vivid red that is
+    /// light on dark themes and deep on light ones, so the vertical line a dragged edge will
+    /// snap to always stands out from the timeline.
+    pub snap_indicator: Color32,
     pub time_blue: Color32,
     pub marker: Color32,
     pub ruler: Color32,
@@ -51,6 +55,7 @@ const LIGHT: Palette = Palette {
     zero_line: Color32::from_rgb(215, 38, 44),
     wave_sel_bg: Color32::from_rgb(55, 105, 95),
     playhead: Color32::from_rgb(235, 64, 80),
+    snap_indicator: Color32::from_rgb(255, 64, 64),
     time_blue: Color32::from_rgb(78, 168, 255),
     marker: Color32::from_rgb(240, 200, 70),
     ruler: Color32::from_rgb(40, 40, 40),
@@ -87,6 +92,7 @@ const DARK: Palette = Palette {
     zero_line: Color32::from_rgb(215, 38, 44),
     wave_sel_bg: Color32::from_rgb(43, 85, 78),
     playhead: Color32::from_rgb(235, 64, 80),
+    snap_indicator: Color32::from_rgb(255, 64, 64),
     time_blue: Color32::from_rgb(78, 168, 255),
     marker: Color32::from_rgb(240, 200, 70),
     ruler: Color32::from_rgb(32, 32, 32),
@@ -165,6 +171,13 @@ fn craft_palette(c: &Craft) -> Palette {
         zero_line: Color32::from_rgb(215, 38, 44),
         wave_sel_bg: toward(canvas, accent, if c.dark { 0.3 } else { 0.25 }),
         playhead: Color32::from_rgb(235, 64, 80),
+        // the snapping indicator follows the theme's contrast: a bright red on dark canvases,
+        // a deep red on light ones
+        snap_indicator: if c.dark {
+            Color32::from_rgb(255, 64, 64)
+        } else {
+            Color32::from_rgb(158, 12, 24)
+        },
         time_blue: if c.dark {
             toward(accent, Color32::WHITE, 0.2)
         } else {
@@ -649,6 +662,13 @@ fn with_contrast(mut p: Palette, dark: bool) -> (Palette, bool) {
     let surfaces = [p.panel, p.panel_header, p.bg, p.control, p.track_head];
     p.text = lift(p.text, &surfaces, 4.5, dark);
     p.text_dim = lift(p.text_dim, &surfaces, 3.0, dark);
+    // the snapping indicator keeps its red but stays clearly visible on the timeline
+    p.snap_indicator = lift(
+        p.snap_indicator,
+        &[p.wave_bg, p.track_lane_a, p.track_lane_b],
+        3.0,
+        dark,
+    );
     let low = contrast(p.text, p.panel) < 7.0;
     (p, low)
 }
@@ -1008,6 +1028,13 @@ fn adjusted(base: &Palette, b: f32, s: f32) -> Palette {
     // blue labels (time readout, active tabs, links) stay visible on the new surfaces too
     p.time_blue = lift(p.time_blue, &surfaces, 3.0, dark);
     p.accent = lift(p.accent, &[p.panel, p.panel_header, p.bg], 3.0, dark);
+    // so does the snapping indicator on the timeline
+    p.snap_indicator = lift(
+        p.snap_indicator,
+        &[p.wave_bg, p.track_lane_a, p.track_lane_b],
+        3.0,
+        dark,
+    );
     p
 }
 
@@ -1087,6 +1114,32 @@ pub fn wave_sel_bg() -> Color32 {
 }
 pub fn playhead() -> Color32 {
     palette().playhead
+}
+
+/// The colour of the snapping point line: the theme's contrast colour for the snapping
+/// indicator — a vivid red, light on dark themes and deep on light ones, so the vertical
+/// line a dragged edge is about to snap to stands out from the timeline in every theme.
+pub fn snap_line() -> Color32 {
+    palette().snap_indicator
+}
+/// The pre-render gauge's colours, taken from the theme so the bar matches every theme: the
+/// rendered part uses the theme's "on" colour (like a render bar's cached frames), the part
+/// still rendering the theme's marker colour faded into the ruler, and the moving edge the
+/// marker colour itself.
+pub fn render_done() -> Color32 {
+    palette().power_on
+}
+pub fn render_todo() -> Color32 {
+    let p = palette();
+    let m = |a: u8, b: u8| ((a as u16 * 2 + b as u16) / 3) as u8;
+    Color32::from_rgb(
+        m(p.ruler.r(), p.marker.r()),
+        m(p.ruler.g(), p.marker.g()),
+        m(p.ruler.b(), p.marker.b()),
+    )
+}
+pub fn render_edge() -> Color32 {
+    palette().marker
 }
 pub fn time_blue() -> Color32 {
     palette().time_blue
@@ -3030,4 +3083,33 @@ pub fn power_drag(ui: &mut egui::Ui, group: &str, on: &mut bool, tip: &str) -> b
         Sense::click_and_drag(),
     );
     drag_toggle(ui, group, &resp, on)
+}
+
+#[cfg(test)]
+mod snap_indicator_tests {
+    use super::*;
+
+    /// The snapping indicator is the theme's contrast colour: red in every theme, and at
+    /// least 3:1 against the timeline surfaces so a drag's snap line is always visible.
+    #[test]
+    fn snap_indicator_contrasts_with_the_timeline() {
+        for i in 0..theme_count() {
+            set_theme(i as u8);
+            let ind = snap_line();
+            let bg = wave_bg();
+            assert!(
+                contrast(ind, bg) >= 3.0,
+                "theme {i}: snap indicator {:?} only {:.1}:1 on wave bg {:?}",
+                ind,
+                contrast(ind, bg),
+                bg
+            );
+            assert!(
+                ind.r() > ind.g() + 30 && ind.r() > ind.b() + 30,
+                "theme {i}: snap indicator {:?} is not red",
+                ind
+            );
+        }
+        set_theme(0);
+    }
 }

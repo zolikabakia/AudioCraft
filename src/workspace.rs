@@ -336,7 +336,7 @@ impl Layout {
             self.right_w = 300.0;
         }
         if self.bottom_h <= 0.0 {
-            self.bottom_h = 104.0;
+            self.bottom_h = 118.0;
         }
         if self.top_h <= 0.0 {
             self.top_h = 300.0;
@@ -392,7 +392,7 @@ pub fn preset(name: &str) -> Layout {
         right_w: 300.0,
         right2_w: 80.0,
         top_h: 300.0,
-        bottom_h: 104.0,
+        bottom_h: 118.0,
         bottom2_h: 104.0,
         ..Default::default()
     };

@@ -138,7 +138,13 @@ pub const COMMANDS: &[Cmd] = cmds![
         "edit.delete",
         "Delete",
         "Del",
-        "Delete the selection, or the selected clip in Multitrack."
+        "Delete the selection. In Multitrack every selected clip goes and the space it occupied stays; selected empty space closes up instead (there is nothing in it to remove)."
+    ),
+    (
+        "edit.ripple_delete",
+        "Ripple Delete",
+        "Shift+Del",
+        "Delete the selected clips and close the gap they leave: the later clips of their track pull left. Selected empty space closes the same way, whichever key pressed it."
     ),
     ("edit.crop", "Crop", "Ctrl+T", "Keep only the selection."),
     (
@@ -485,7 +491,13 @@ pub const COMMANDS: &[Cmd] = cmds![
         "view.toggle_snapping",
         "Toggle Snapping",
         "",
-        "Snap clips, drops and the playhead to clip edges, the playhead and the session start."
+        "Snap clips, drops and the playhead to the chosen targets: clip starts and ends, markers, the ruler's time marks, the playhead and the session start (the magnet's menu in the Multitrack Tools corner picks them)."
+    ),
+    (
+        "view.multitrack_tools",
+        "Multitrack Tools",
+        "",
+        "Show or hide the Multitrack Tools in the multitrack view's corner (header views, metronome, stretching, snapping with its targets, auto-scroll)."
     ),
     (
         "view.toggle_auto_scroll",
@@ -1224,6 +1236,7 @@ impl App {
             "edit.mix_paste" => Some("mixpaste"),
             "edit.paste_new" => Some("pastenew"),
             "edit.delete" => Some("delete"),
+            "edit.ripple_delete" => Some("rippledelete"),
             "edit.crop" => Some("crop"),
             "edit.select_all" => Some("all"),
             "edit.deselect" => Some("none"),
@@ -1306,6 +1319,7 @@ impl App {
             "window.workspace_reset" => self.ws.reset(),
             "window.workspace_save" => self.ws.save_current(),
             "view.toggle_snapping" => self.snapping = !self.snapping,
+            "view.multitrack_tools" => self.show_tools_window = !self.show_tools_window,
             "view.toggle_auto_scroll" => self.auto_scroll = !self.auto_scroll,
             "view.theme_toggle" => {
                 // the next theme in the list, round to the first
