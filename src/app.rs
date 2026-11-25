@@ -1063,6 +1063,13 @@ impl App {
                         make_default: false,
                     });
                 }
+                Some("noise") => {
+                    app.dialog = Some(Dialog::Noise {
+                        color: crate::dsp::NoiseColor::Pink,
+                        db: -12.0,
+                        secs: 5.0,
+                    });
+                }
                 Some("session") => {
                     let d = app.new_session_dialog();
                     app.dialog = Some(d);
@@ -3462,9 +3469,13 @@ The take is still open; save it with File > Save As."
                     s.set_rack(&rack.0, rack.1, rack.2, rack.3, rack.4);
                 }
             }
-            Mode::Multitrack => self.refresh_mix(false),
+            // a dialog's preview keeps its own sound playing
+            Mode::Multitrack if self.preview_audio.is_none() => self.refresh_mix(false),
+            Mode::Multitrack => {}
         }
-        if playing || rec {
+        if self.preview_audio.is_some() {
+            // a dialog's preview plays: the playhead stays where OK will insert
+        } else if playing || rec {
             // the auto-scroll button, and how the view follows (Preferences > General)
             let scroll_mode = crate::prefs::auto_scroll_mode();
             let follow = self.auto_scroll && scroll_mode != 2;

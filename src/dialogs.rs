@@ -224,6 +224,9 @@ impl App {
 
     /// Play rendered audio instead of the file (dialog previews); `stop_preview` ends it.
     pub fn play_preview(&mut self, data: std::sync::Arc<AudioData>, looping: bool) {
+        if self.preview_audio.is_none() {
+            self.stop();
+        }
         self.engine.ensure_output();
         self.reset_level_meters();
         {
@@ -236,6 +239,39 @@ impl App {
             s.playing = true;
         }
         self.preview_audio = Some(data);
+    }
+
+    /// The Preview row of the generator dialogs (Tones, Noise, DTMF): plays what OK would insert
+    /// (looping, at most 10 s); while it plays, a change is heard once the slider is let go.
+    fn gen_preview_row(&mut self, ui: &mut egui::Ui, changed: bool, make: impl FnOnce() -> AudioData) {
+        let previewing = self.preview_audio.is_some();
+        let mut start = false;
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if theme::icon_button(ui, theme::Icon::Play, previewing, "Preview: play what OK inserts (loops)").clicked() {
+                if previewing {
+                    self.stop_preview();
+                } else {
+                    start = true;
+                }
+            }
+            ui.label(
+                RichText::new(if previewing { "Previewing (loops)" } else { "Preview" })
+                    .small()
+                    .color(theme::text_dim()),
+            );
+        });
+        if previewing && changed {
+            self.preview_dirty = true;
+        }
+        let held = ui.input(|i| i.pointer.any_down());
+        if start || (self.preview_audio.is_some() && self.preview_dirty && !held) {
+            self.preview_dirty = false;
+            let d = make();
+            if d.frames() > 0 {
+                self.play_preview(std::sync::Arc::new(d), true);
+            }
+        }
     }
 
     pub fn stop_preview(&mut self) {
@@ -889,6 +925,7 @@ impl App {
                     });
                 }
                 Dialog::Tone { freq, wave, db, secs } => {
+                    let before = (*freq, *wave, *db, *secs);
                     egui::Grid::new("tone").num_columns(2).show(ui, |ui| {
                         ui.label("Waveform");
                         ui.horizontal(|ui| {
@@ -908,10 +945,16 @@ impl App {
                         ui.add(crate::theme::RSlider::new(secs, 0.1..=600.0).logarithmic(true).suffix(" s"));
                         ui.end_row();
                     });
-                    ui.label(RichText::new(if self.cur().is_some() { "Inserted at the playhead of the current file." } else { "Creates a new file." }).small().color(theme::text_dim()));
+                    ui.label(RichText::new(if self.cur().is_some() && self.mode == Mode::Waveform { "Inserted at the playhead of the current file." } else { "Creates a new file." }).small().color(theme::text_dim()));
+                    let (f, w, d, s) = (*freq, *wave, *db, *secs);
+                    let (rate, chs) = self.gen_format();
+                    self.gen_preview_row(ui, before != (f, w, d, s), move || {
+                        dsp::gen_tone(rate, chs, s.min(10.0), f, w, d)
+                    });
                     ok_cancel(ui, "OK", &mut ok, &mut close);
                 }
                 Dialog::Noise { color, db, secs } => {
+                    let before = (*color, *db, *secs);
                     egui::Grid::new("noise").num_columns(2).show(ui, |ui| {
                         ui.label("Color");
                         ui.horizontal(|ui| {
@@ -926,6 +969,12 @@ impl App {
                         ui.label("Duration");
                         ui.add(crate::theme::RSlider::new(secs, 0.1..=600.0).logarithmic(true).suffix(" s"));
                         ui.end_row();
+                    });
+                    ui.label(RichText::new(if self.cur().is_some() && self.mode == Mode::Waveform { "Inserted at the playhead of the current file." } else { "Creates a new file." }).small().color(theme::text_dim()));
+                    let (c, d, s) = (*color, *db, *secs);
+                    let (rate, chs) = self.gen_format();
+                    self.gen_preview_row(ui, before != (c, d, s), move || {
+                        dsp::gen_noise(rate, chs, s.min(10.0), c, d)
                     });
                     ok_cancel(ui, "OK", &mut ok, &mut close);
                 }
@@ -1133,6 +1182,7 @@ impl App {
                     ok_cancel(ui, "Apply", &mut ok, &mut close);
                 }
                 Dialog::Dtmf { digits, tone_ms, pause_ms, db } => {
+                    let before = (digits.clone(), *tone_ms, *pause_ms, *db);
                     ui.horizontal(|ui| {
                         ui.label("Dial string");
                         ui.text_edit_singleline(digits);
@@ -1141,6 +1191,12 @@ impl App {
                     ui.add(crate::theme::RSlider::new(tone_ms, 20.0..=1000.0).suffix(" ms").text("Tone length"));
                     ui.add(crate::theme::RSlider::new(pause_ms, 0.0..=1000.0).suffix(" ms").text("Pause"));
                     ui.add(crate::theme::RSlider::new(db, -60.0..=0.0).suffix(" dB").text("Volume"));
+                    let now = (digits.clone(), *tone_ms, *pause_ms, *db);
+                    let (rate, chs) = self.gen_format();
+                    let changed = before != now;
+                    self.gen_preview_row(ui, changed, move || {
+                        crate::procs::dtmf(rate, chs, &now.0, now.1, now.2, now.3)
+                    });
                     ok_cancel(ui, "OK", &mut ok, &mut close);
                 }
                 Dialog::ClickPop { sensitivity } => {
@@ -1350,11 +1406,15 @@ impl App {
                 self.status = e;
             }
         }
+        let generator = matches!(dlg, Dialog::Tone { .. } | Dialog::Noise { .. } | Dialog::Dtmf { .. });
+        if ok && generator {
+            self.stop_preview();
+        }
         if ok {
             self.dialog_commit(&dlg);
             close = true;
         }
-        if matches!(dlg, Dialog::Speed { .. }) && (!open || close || ok) {
+        if (matches!(dlg, Dialog::Speed { .. }) || generator) && (!open || close || ok) {
             self.stop_preview();
         }
         if matches!(dlg, Dialog::Effect { .. }) && (!open || close) && !ok {
@@ -1368,7 +1428,7 @@ impl App {
         }
     }
 
-    fn dialog_commit(&mut self, dlg: &Dialog) {
+    pub(crate) fn dialog_commit(&mut self, dlg: &Dialog) {
         match dlg {
             Dialog::NewWorkspace { name } => self.ws.save_as(name),
             Dialog::EditWorkspaces => {}
@@ -1662,18 +1722,12 @@ impl App {
                 db,
                 secs,
             } => {
-                let (rate, chs) = self
-                    .cur()
-                    .map(|f| (f.data.rate, f.data.channels()))
-                    .unwrap_or((48000, 2));
+                let (rate, chs) = self.gen_format();
                 let t = dsp::gen_tone(rate, chs, *secs, *freq, *wave, *db);
                 self.insert_generated("Generate Tones", t);
             }
             Dialog::Noise { color, db, secs } => {
-                let (rate, chs) = self
-                    .cur()
-                    .map(|f| (f.data.rate, f.data.channels()))
-                    .unwrap_or((48000, 2));
+                let (rate, chs) = self.gen_format();
                 let t = dsp::gen_noise(rate, chs, *secs, *color, *db);
                 self.insert_generated("Generate Noise", t);
             }
@@ -1761,10 +1815,7 @@ impl App {
                 pause_ms,
                 db,
             } => {
-                let (rate, chs) = self
-                    .cur()
-                    .map(|f| (f.data.rate, f.data.channels()))
-                    .unwrap_or((48000, 2));
+                let (rate, chs) = self.gen_format();
                 let t = crate::procs::dtmf(rate, chs, digits, *tone_ms, *pause_ms, *db);
                 self.insert_generated("Generate DTMF Tones", t);
             }
@@ -1811,14 +1862,37 @@ impl App {
         }
     }
 
+    /// The sample rate and channels a generator makes: the current file's in the Waveform
+    /// Editor, otherwise the session's rate (or 48 kHz) in stereo.
+    pub fn gen_format(&self) -> (u32, usize) {
+        match (self.mode, self.cur()) {
+            (Mode::Waveform, Some(f)) => (f.data.rate, f.data.channels()),
+            _ => (self.session.as_ref().map(|s| s.rate).unwrap_or(48000), 2),
+        }
+    }
+
+    /// A generated sound as a new file whose history starts empty: Ctrl+Z takes the sound
+    /// back (leaving the empty file) and Ctrl+Shift+Z brings it again.
+    pub fn new_generated_file(&mut self, name: String, label: &str, t: AudioData) {
+        self.stop();
+        let empty = AudioData::new(t.rate, t.channels(), 0);
+        self.add_file(name, None, empty, 32, true, "New File");
+        self.switch_mode(Mode::Waveform);
+        if let Some(f) = self.cur_mut() {
+            f.cursor = 0.0;
+            f.push(label, t);
+            f.selection = None;
+            f.view = (0.0, f.data.duration().max(0.001));
+        }
+    }
+
     fn insert_generated(&mut self, label: &str, t: AudioData) {
         if self.cur().is_none() || self.mode != Mode::Waveform {
-            self.switch_mode(Mode::Waveform);
-            self.add_file(format!("{label}.wav"), None, t, 32, true, label);
+            self.new_generated_file(format!("{label}.wav"), label, t);
             return;
         }
         self.stop();
-        let f = self.cur_mut().unwrap();
+        let Some(f) = self.cur_mut() else { return };
         let r = f.data.rate as f64;
         let at = (f.cursor * r) as usize;
         let len = t.duration();

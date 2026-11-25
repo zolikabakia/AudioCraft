@@ -69,7 +69,7 @@ Usage:
   audiocraft --batch IN --do STEP [--do STEP...] [--out OUT.wav]
                                              process a file without opening a window
   audiocraft --screenshot OUT.png [--demo] [--multitrack | --mixer | --spectral]
-                                             [--fxshot EFFECT] [--shot-dialog file|session|close|prefs|color] [--autoshot]
+                                             [--fxshot EFFECT] [--shot-dialog file|session|close|prefs|color|noise] [--autoshot]
                                              open a panel or dialog (diagnostic);
                                              --autoshot opens volume automation lanes for the shot
 

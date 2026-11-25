@@ -793,15 +793,7 @@ impl App {
                 self.stop_preview();
                 let n = self.files.len() + 1;
                 let keep = self.dialog.take();
-                self.add_file(
-                    format!("Speech {n:02}.wav"),
-                    None,
-                    (*d).clone(),
-                    32,
-                    true,
-                    "Generate Speech",
-                );
-                self.switch_mode(Mode::Waveform);
+                self.new_generated_file(format!("Speech {n:02}.wav"), "Generate Speech", (*d).clone());
                 self.dialog = keep;
                 self.extra.speech_status = format!("Added Speech {n:02}.wav to the Files panel");
             }

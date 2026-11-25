@@ -4740,3 +4740,70 @@ fn busses_take_outputs_and_sends() {
     let mix = s.snapshot(&look);
     assert_eq!(mix.tracks[b].to_bus, None);
 }
+
+/// Generating a sound can be undone: from the Multitrack Editor (a new file, whose first
+/// state is empty) and into an open file (inserted at the playhead); redo brings it back.
+#[test]
+fn generated_sound_can_be_undone() {
+    use crate::app::{Dialog, Mode};
+    let mut h = Harness::new(true, true);
+    h.frames(2);
+    let files_before = h.app.files.len();
+    let noise = Dialog::Noise {
+        color: crate::dsp::NoiseColor::Pink,
+        db: -12.0,
+        secs: 2.0,
+    };
+    h.app.dialog_commit(&noise);
+    h.frames(2);
+    assert_eq!(h.app.files.len(), files_before + 1, "a new file");
+    assert_eq!(h.app.mode, Mode::Waveform);
+    let frames = |h: &Harness| h.app.cur().map(|f| f.data.frames()).unwrap_or(0);
+    let made = frames(&h);
+    assert!(made > 0);
+    h.app.undo();
+    assert_eq!(frames(&h), 0, "Ctrl+Z takes the noise back");
+    h.app.redo();
+    assert_eq!(frames(&h), made, "and redo brings it again");
+
+    // into an open file, at the playhead
+    let mut h = Harness::new(true, false);
+    h.frames(2);
+    let before = frames(&h);
+    assert!(before > 0);
+    h.app.set_cursor(0.5);
+    let tone = Dialog::Tone {
+        freq: 440.0,
+        wave: crate::dsp::Wave::Sine,
+        db: -6.0,
+        secs: 1.0,
+    };
+    h.app.dialog_commit(&tone);
+    assert!(frames(&h) > before);
+    h.app.undo();
+    assert_eq!(frames(&h), before, "the tone is taken out again");
+}
+
+/// The generator preview plays its own sound: in the Multitrack Editor the session mix does
+/// not replace it and the playhead stays put; stopping it hands the transport back.
+#[test]
+fn generator_preview_plays_without_moving_the_playhead() {
+    let mut h = Harness::new(true, true);
+    h.frames(2);
+    h.app.set_cursor(1.25);
+    let (rate, chs) = h.app.gen_format();
+    let d = std::sync::Arc::new(crate::dsp::gen_noise(rate, chs, 1.0, crate::dsp::NoiseColor::White, -12.0));
+    h.app.play_preview(d.clone(), true);
+    h.app.engine.lock().pos = 0.6;
+    h.frames(3);
+    {
+        let s = h.app.engine.lock();
+        assert!(matches!(&s.source, crate::engine::Source::File(x) if std::sync::Arc::ptr_eq(x, &d)));
+        assert!(s.playing);
+    }
+    assert!((h.app.cursor() - 1.25).abs() < 1e-9, "the playhead stays where OK inserts");
+    h.app.stop_preview();
+    h.frames(2);
+    assert!(!h.app.engine.lock().playing);
+    assert!(h.app.preview_audio.is_none());
+}
