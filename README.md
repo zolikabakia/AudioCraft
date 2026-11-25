@@ -310,6 +310,22 @@ Files dragged in from a file manager need X11: under a Wayland desktop AudioCraf
 XWayland so drag and drop works (`AUDIOCRAFT_WAYLAND=1` runs it as a native Wayland window, which
 cannot receive files dragged in).
 
+### From Windows (no Linux machine needed)
+
+```
+rustup target add x86_64-unknown-linux-gnu
+python -m pip install --user ziglang
+cargo install cargo-zigbuild
+python scripts/build-linux-cross.py
+```
+
+This cross-builds the same Linux program into `dist/linux/` (program, icon, desktop entry, README,
+licence and `audiocraft-linux-x86_64.tar.gz`). Zig links it against glibc 2.28, so it runs on
+Linux desktops from 2018 on (Ubuntu 20.04+, Debian 10+, Fedora 29+). It needs only the ALSA
+sound library (`libasound.so.2`, on every desktop install) and loads X11/Wayland/OpenGL when it
+starts. For the link step the script builds a stand-in for ALSA that is never shipped. Unpack
+with `tar xzf audiocraft-linux-x86_64.tar.gz` and run `./audiocraft-linux-x86_64/audiocraft-linux-x86_64`.
+Generate Speech uses `espeak` or `flite` from the distribution's packages.
 
 For a binary without installing anything locally, push this folder to GitHub: the
 `Linux build` workflow (`build-linux.yml`) compiles it on Ubuntu and uploads

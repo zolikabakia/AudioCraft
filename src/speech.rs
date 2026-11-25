@@ -13,6 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Quote a string as a PowerShell single-quoted literal. A single quote is doubled; `$` and
 /// backslashes stay literal, so text from the UI can never be interpreted as script code.
+#[cfg(any(test, windows))]
 pub fn ps_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
@@ -47,11 +48,13 @@ pub fn preset(voice: &str) -> Option<(&'static str, &'static str, usize, f32)> {
 }
 
 /// The engine's pitch steps for a shift in semitones (SAPI `absmiddle`, -10..10 ≈ ±4.5 st).
+#[cfg(any(test, windows))]
 pub fn sapi_pitch(semis: f32) -> i32 {
     (semis * 2.2).round().clamp(-10.0, 10.0) as i32
 }
 
 /// Every SAPI voice token on the computer, the classic and the newer (OneCore) ones.
+#[cfg(any(test, windows))]
 const SAPI_TOKENS: &str = "$all = @(); foreach ($id in @('HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Speech\\Voices','HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Speech_OneCore\\Voices')) { try { $c = New-Object -ComObject SAPI.SpObjectTokenCategory; $c.SetId($id, $false); $ts = $c.EnumerateTokens(); for ($i = 0; $i -lt $ts.Count; $i++) { $all += $ts.Item($i) } } catch {} }";
 
 /// The voices installed on this computer (Windows; asked once, on a worker thread, and empty
@@ -106,6 +109,7 @@ pub fn pitch_shift(d: &AudioData, semis: f32) -> AudioData {
 }
 
 /// Text made safe inside the engine's XML markup.
+#[cfg(any(test, windows))]
 fn xml_escape(t: &str) -> String {
     t.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -113,6 +117,7 @@ fn xml_escape(t: &str) -> String {
 }
 
 /// The PowerShell that speaks `text` through SAPI into `out` (48 kHz mono WAV).
+#[cfg(any(test, windows))]
 fn windows_script(text: &str, voice: &str, rate: i32, semis: f32, out: &Path) -> String {
     let mut lines = vec![
         "$ErrorActionPreference = 'Stop'".to_string(),
@@ -180,7 +185,7 @@ fn synthesize_with(text: &str, voice: &str, rate: i32, semis: f32) -> Result<Aud
     }
     let out = temporary_wav();
     #[cfg(windows)]
-    let attempted = {
+    {
         let script = windows_script(text, voice, rate, semis, &out);
         // the shared quiet command: no console window flashes while speaking
         let mut cmd = crate::ffmpeg::command("powershell.exe");
@@ -202,12 +207,10 @@ fn synthesize_with(text: &str, voice: &str, rate: i32, semis: f32) -> Result<Aud
                 "The Windows speech engine could not speak that text: {why}"
             ));
         }
-        true
-    };
+    }
+    // which engine spoke: flite has no pitch control, so its voice is shifted afterwards
     #[cfg(not(windows))]
-    let mut flite_used = false;
-    #[cfg(not(windows))]
-    let attempted = {
+    let flite_used = {
         // espeak takes a female/male variant and the rate; flite speaks as it is
         let espeak_voice = match preset(voice.trim()).map(|p| p.1) {
             Some("Female") => "en+f3",
@@ -242,9 +245,8 @@ fn synthesize_with(text: &str, voice: &str, rate: i32, semis: f32) -> Result<Aud
                 "No speech engine is installed. Install espeak or flite, or run AudioCraft on Windows. ({last})"
             ));
         }
-        true
+        flite_used
     };
-    let _ = attempted;
     if !out.exists() {
         return Err("The speech engine ran but did not write an audio file.".into());
     }
