@@ -718,8 +718,22 @@ pub struct App {
     /// A cache follows the playhead (Preferences > Multitrack > Pre-render) or holds the whole
     /// track when it fits its share of the cap; outside it the track plays live.
     pub prerender: std::collections::HashMap<u64, PreCache>,
+    /// Media the session uses that could not be found: file id -> where it was expected.
+    pub offline: std::collections::HashMap<u64, crate::relink::Offline>,
+    /// MCP: the server for AI assistants, its activity log and waiting requests.
+    pub mcp: crate::mcp::McpState,
+    /// The Relink Media window, while open.
+    pub relink: Option<crate::relink::RelinkState>,
     /// When the playing mix last picked up newly rendered audio.
     pub prerender_pushed: Option<std::time::Instant>,
+    /// Pre-render content hashes per track, and the (revision, file versions, file count) they
+    /// were worked out for.
+    pub prerender_keys: Option<((u64, u64, usize), std::collections::HashMap<u64, u64>)>,
+    /// Auto Save: when the last backup check ran, and the content fingerprint last backed up.
+    pub autosave_at: Option<std::time::Instant>,
+    /// The time selection a punch-in recording keeps (Preferences > Playback and Recording).
+    pub punch: Option<(f64, f64)>,
+    pub autosave_fp: Option<u64>,
     /// Effects Rack presets saved by the person (name, slots).
     pub user_presets: Vec<(String, Vec<EffectSlot>)>,
     pub rack_preset_name: String,
@@ -751,7 +765,7 @@ pub struct App {
     pub header_view: u8,
     /// The Multitrack Tools in the multitrack view's corner (snapping and the other modifiers)
     /// are shown.
-    pub show_tools_window: bool,
+    pub show_multitrack_tools: bool,
     /// The snapping-target checkboxes inside that window are unfolded.
     pub snap_menu_open: bool,
     /// Global clip stretching: stretch handles on every clip's top corners.
@@ -822,6 +836,7 @@ impl App {
         let prefs = crate::prefs::load();
         crate::theme::set_theme(prefs.color_theme);
         crate::theme::set_adjust(prefs.brightness, prefs.saturation);
+        crate::theme::set_snap_override(prefs.snap_line_color);
         theme::setup(&cc.egui_ctx);
         if timing {
             eprintln!("theme ready after {} ms", since());
@@ -899,14 +914,21 @@ impl App {
             rack_window: None,
             rack_entire: false,
             prerender: Default::default(),
+            offline: Default::default(),
+            relink: None,
+            mcp: Default::default(),
             prerender_pushed: None,
+            prerender_keys: None,
+            autosave_at: None,
+            punch: None,
+            autosave_fp: None,
             user_presets: vec![],
             effect_presets: vec![],
             rack_focus: false,
             files_focus: false,
             files_drop_rects_last: vec![],
             header_view: 0,
-            show_tools_window: true,
+            show_multitrack_tools: true,
             snap_menu_open: false,
             stretch_mode: false,
             snapping: true,
@@ -941,11 +963,36 @@ impl App {
         };
         crate::prefs::set_live(&app.prefs);
         crate::theme::set_theme(app.prefs.color_theme);
+        // the Master plays on the outputs chosen in Preferences > Audio Channel Mapping
+        app.apply_out_map();
+        // Preferences > Effects > plug-ins at start-up: the list from the last scan, read from
+        // disk without loading any plug-in (loading them all made opening and closing slow);
+        // each plug-in loads when it is first used, and Rescan looks for new ones
+        if app.prefs.plugin_scan_start && app.screenshot.is_none() && !cfg!(test) {
+            app.hosted = crate::plugins::saved_list();
+        }
         crate::video::set_preview_res(app.prefs.video_resolution);
         crate::ffmpeg::set_selected(Some(PathBuf::from(&app.prefs.video_decoder_exe)));
         app.time_format = TimeFormat::from_index(app.prefs.time_format);
+        let no_files = files.is_empty();
         for f in files {
             app.open_path(&f);
+        }
+        // Preferences > General > Open the last session on start-up (not when files were given)
+        if no_files && !demo && app.prefs.open_last_session && app.screenshot.is_none() {
+            let last = app.recent.iter().find(|p| {
+                p.is_file()
+                    && p
+                        .extension()
+                        .map(|e| {
+                            let e = e.to_string_lossy().to_ascii_lowercase();
+                            e == "sesx" || e == "acsession" || e == "audiocraft"
+                        })
+                        .unwrap_or(false)
+            });
+            if let Some(p) = last.cloned() {
+                app.load_session(&p);
+            }
         }
         if demo {
             app.load_demo();
@@ -1019,6 +1066,16 @@ impl App {
                 Some("session") => {
                     let d = app.new_session_dialog();
                     app.dialog = Some(d);
+                }
+                Some("color") => {
+                    let t = app
+                        .session
+                        .as_ref()
+                        .and_then(|s| s.tracks.first())
+                        .map(|t| (t.id, t.color));
+                    if let Some((track, color)) = t {
+                        app.dialog = Some(Dialog::TrackColor { track, color });
+                    }
                 }
                 Some("close") => {
                     if app.files.is_empty() {
@@ -1813,10 +1870,12 @@ impl App {
         let path = match (save_as, keep) {
             (false, Some(p)) => p,
             _ => {
-                let stem = std::path::Path::new(&f.name)
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or("Untitled".into());
+                let stem = crate::library::bare_name(&f.name);
+                let stem = if stem.is_empty() {
+                    "Untitled".to_string()
+                } else {
+                    stem
+                };
                 let ext = f
                     .path
                     .as_ref()
@@ -1836,9 +1895,20 @@ impl App {
                 for (n, e) in audio::SAVE_FILTERS {
                     dlg = dlg.add_filter(*n, e);
                 }
+                let allowed: Vec<&str> = audio::SAVE_FILTERS
+                    .iter()
+                    .flat_map(|(_, e)| e.iter().copied())
+                    .collect();
                 match dlg.ask_save() {
-                    Some(p) if audio::SaveFormat::from_path(&p).is_some() => p,
-                    Some(p) => p.with_extension("wav"),
+                    // "rain.wav" saved as MP3 is "rain.mp3", never "rain.wav.mp3"
+                    Some(p) => {
+                        let p = crate::library::clean_save_path(&p, &allowed, &ext);
+                        if audio::SaveFormat::from_path(&p).is_some() {
+                            p
+                        } else {
+                            p.with_extension("wav")
+                        }
+                    }
                     None => return false,
                 }
             }
@@ -1957,9 +2027,30 @@ impl App {
 
     pub fn undo(&mut self) {
         if self.mode == Mode::Multitrack && self.session.is_some() {
-            if self.session_hist_pos > 0 {
-                self.session_hist_pos -= 1;
+            // a drag still in progress must not move things again after the undo
+            self.end_session_drags();
+            // an edit not yet recorded (a drag released this very frame) gets its step first,
+            // so this Ctrl+Z takes back exactly that edit
+            self.session_hist_catch_up(false);
+            // step back to the first state that really differs from what is shown: steps that
+            // changed nothing visible never make a Ctrl+Z look like it did nothing
+            let now = self.session.as_ref().map(|s| s.hist_state());
+            let mut p = self.session_hist_pos;
+            while p > 0 {
+                p -= 1;
+                if self.session_hist.get(p).map(|h| &h.1) != now.as_ref() {
+                    break;
+                }
+            }
+            if p != self.session_hist_pos {
+                let label = self
+                    .session_hist
+                    .get(self.session_hist_pos)
+                    .map(|h| h.0.clone())
+                    .unwrap_or_default();
+                self.session_hist_pos = p;
                 self.restore_session_hist();
+                self.status = format!("Undo {label}");
             }
             return;
         }
@@ -1974,9 +2065,20 @@ impl App {
     }
     pub fn redo(&mut self) {
         if self.mode == Mode::Multitrack && self.session.is_some() {
-            if self.session_hist_pos + 1 < self.session_hist.len() {
-                self.session_hist_pos += 1;
+            self.end_session_drags();
+            let now = self.session.as_ref().map(|s| s.hist_state());
+            let mut p = self.session_hist_pos;
+            while p + 1 < self.session_hist.len() {
+                p += 1;
+                if self.session_hist.get(p).map(|h| &h.1) != now.as_ref() {
+                    break;
+                }
+            }
+            if p != self.session_hist_pos {
+                self.session_hist_pos = p;
                 self.restore_session_hist();
+                let label = self.session_hist[p].0.clone();
+                self.status = format!("Redo {label}");
             }
             return;
         }
@@ -1990,13 +2092,67 @@ impl App {
         }
     }
 
+    /// Forget any clip, keyframe or handle drag in progress (an undo or redo replaced what it
+    /// was moving).
+    pub fn end_session_drags(&mut self) {
+        self.multi_drag.key_drag = None;
+        self.multi_drag.drag = crate::ui_multi::MDrag::None;
+        self.multi_drag.changed = false;
+        self.multi_drag.edge_snap = None;
+    }
+
+    /// Track heights changed by scrolling (the wheel over the headers, Alt+wheel, the vertical
+    /// navigator) are a view change, not an edit: every undo step takes the new heights, so
+    /// nothing is logged and Undo/Redo never resize the tracks back.
+    /// The device channels the Master plays on (Preferences > Audio Channel Mapping).
+    pub fn apply_out_map(&mut self) {
+        let m = [
+            self.prefs.map_left.max(1) as usize - 1,
+            self.prefs.map_right.max(1) as usize - 1,
+        ];
+        self.engine.lock().out_map = m;
+    }
+
+    pub fn keep_heights_out_of_undo(&mut self) {
+        let Some(s) = self.session.as_ref() else {
+            return;
+        };
+        let heights: std::collections::HashMap<u64, f32> =
+            s.tracks.iter().map(|t| (t.id, t.height)).collect();
+        for (_, h) in self.session_hist.iter_mut() {
+            for t in h.tracks.iter_mut() {
+                if let Some(v) = heights.get(&t.id) {
+                    t.height = *v;
+                }
+            }
+        }
+    }
+
     pub fn session_push(&mut self, label: &str) {
         if let Some(s) = &mut self.session {
             s.touch();
+            // the same content as the current step (the safety net already recorded this
+            // edit as "Edit"): name that step instead of adding an identical one, which would
+            // make the next Ctrl+Z appear to do nothing
+            let state = s.hist_state();
+            if self.session_hist_pos + 1 == self.session_hist.len()
+                && self
+                    .session_hist
+                    .get(self.session_hist_pos)
+                    .is_some_and(|(_, h)| *h == state)
+                && self.session_hist_pos > 0
+            {
+                if let Some(e) = self.session_hist.get_mut(self.session_hist_pos) {
+                    e.0 = label.to_string();
+                }
+                self.session_hist_seen = s.revision;
+                return;
+            }
             self.session_hist.truncate(self.session_hist_pos + 1);
             self.session_hist.push((label.to_string(), s.hist_state()));
             self.session_hist_pos = self.session_hist.len() - 1;
-            if self.session_hist.len() > 100 {
+            // Preferences > Memory > History limit
+            while self.session_hist.len() > crate::prefs::history_limit() && self.session_hist_pos > 0 {
                 self.session_hist.remove(0);
                 self.session_hist_pos -= 1;
             }
@@ -2074,7 +2230,9 @@ impl App {
             return;
         }
         let (a, b) = f.range();
-        let d = f.data.without(a, b);
+        // Preferences > Data: a short crossfade at the seam, so a delete never clicks
+        let fade = crate::prefs::smooth_delete_frames(f.data.rate);
+        let d = f.data.without_smooth(a, b, fade);
         let t = a as f64 / f.data.rate as f64;
         f.selection = None;
         f.cursor = t;
@@ -2527,6 +2685,8 @@ impl App {
                         )
                     }
                 };
+                let stop_after = (self.prefs.stop_at_end && !looping && !recording && end > 1e8)
+                    .then_some(len);
                 let mut s = self.engine.lock();
                 if (s.pos - start).abs() > 0.01 {
                     s.flush_effects();
@@ -2534,12 +2694,45 @@ impl App {
                 s.pos = start;
                 s.end = end;
                 s.loop_start = ls;
+                s.stop_after = stop_after;
                 s.playing = true;
                 drop(s);
                 self.play_origin = start;
             }
         }
         self.was_playing = true;
+    }
+
+    /// Play with pre-roll and post-roll (Preferences > Playback and Recording): the selection
+    /// (or from the playhead) with that much before and after it. The playhead comes back to
+    /// where it was when Stop is pressed with "return to start" on.
+    pub fn play_with_roll(&mut self) {
+        let pre = self.prefs.preroll_s.clamp(0.0, 60.0) as f64;
+        let post = self.prefs.postroll_s.clamp(0.0, 60.0) as f64;
+        let (sel, cursor, len) = match self.mode {
+            Mode::Waveform => match self.cur() {
+                Some(f) => (f.selection, f.cursor, f.data.duration()),
+                None => return,
+            },
+            Mode::Multitrack => match &self.session {
+                Some(s) => (s.selection, s.cursor, s.length()),
+                None => return,
+            },
+        };
+        let (start, end) = match sel {
+            Some((a, b)) if b - a > 0.0005 => ((a - pre).max(0.0), b + post),
+            _ => ((cursor - pre).max(0.0), if self.mode == Mode::Waveform { len } else { 1e9 }),
+        };
+        let end = if self.mode == Mode::Waveform { end.min(len) } else { end };
+        self.play();
+        let mut s = self.engine.lock();
+        if s.playing {
+            s.flush_effects();
+            s.pos = start;
+            s.end = end;
+            s.loop_start = start;
+            s.stop_after = None;
+        }
     }
 
     pub fn stop(&mut self) {
@@ -2650,47 +2843,79 @@ The take is still open; save it with File > Save As."
         let Some(rec) = self.engine.stop_recording() else {
             return;
         };
-        let Some((at, track)) = self.recording_at.take() else {
+        let Some((mut at, track)) = self.recording_at.take() else {
             return;
         };
+        // punch-in: only the part inside the time selection is kept
+        let mut rec = rec;
+        if let Some((a, b)) = self.punch.take() {
+            let rate = rec.rate.max(1) as f64;
+            let (keep_a, keep_b) = (a.max(at), b.min(at + rec.duration()));
+            if keep_b <= keep_a {
+                self.status = "Nothing was recorded inside the time selection".into();
+                return;
+            }
+            rec = rec.slice(
+                ((keep_a - at) * rate).round() as usize,
+                ((keep_b - at) * rate).round() as usize,
+            );
+            at = keep_a;
+        }
         match (self.mode, track) {
             (Mode::Multitrack, Some(t)) => {
                 let rate = self.session.as_ref().map(|s| s.rate).unwrap_or(48000);
-                let d = rec.conform(rate, rec.channels().min(2));
-                let len = d.duration();
-                let tname = self
+                // every armed track gets a take of its own input: a mono input makes a mono
+                // take, a stereo pair a stereo one (tracks on the same input share one file)
+                let targets: Vec<(usize, String, [usize; 2])> = self
                     .session
                     .as_ref()
-                    .and_then(|s| s.tracks.get(t))
-                    .map(|t| t.name.clone())
-                    .unwrap_or("Track".into());
-                let n = self.files.len() + 1;
-                let wanted = format!("{tname}_Recorded {n:03}");
-                // the take goes to the recordings folder right away, so it is never lost
-                let saved = self.save_take(&d, &wanted);
-                let name = saved
-                    .as_ref()
-                    .and_then(|p| p.file_name())
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or(format!("{wanted}.wav"));
-                let cur = self.current;
-                let fid = self.add_file(name.clone(), saved, d, 32, true, "Record");
-                self.current = cur.or(Some(fid));
-                if let Some(s) = &mut self.session {
-                    // every armed track gets the take
-                    let mut targets: Vec<usize> = s
-                        .tracks
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, t)| t.arm && t.can_record())
-                        .map(|(i, _)| i)
-                        .collect();
-                    if targets.is_empty() {
-                        targets.push(t);
+                    .map(|s| {
+                        let mut v: Vec<(usize, String, [usize; 2])> = s
+                            .tracks
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, t)| t.arm && t.can_record())
+                            .map(|(i, t)| (i, t.name.clone(), crate::extras::input_channels(&t.io.input)))
+                            .collect();
+                        if v.is_empty() {
+                            if let Some(tr) = s.tracks.get(t) {
+                                v.push((t, tr.name.clone(), crate::extras::input_channels(&tr.io.input)));
+                            }
+                        }
+                        v
+                    })
+                    .unwrap_or_default();
+                let mut made: Vec<([usize; 2], u64, String, f64)> = vec![];
+                let mut placed: Vec<(usize, u64, String, f64)> = vec![];
+                for (ti, tname, chans) in targets {
+                    let last = rec.channels().saturating_sub(1);
+                    let chans = [chans[0].min(last), chans[1].min(last)];
+                    if let Some(m) = made.iter().find(|m| m.0 == chans) {
+                        placed.push((ti, m.1, m.2.clone(), m.3));
+                        continue;
                     }
-                    for t in targets {
+                    let take = input_take(&rec, chans);
+                    let d = take.conform(rate, take.channels());
+                    let len = d.duration();
+                    let n = self.files.len() + 1;
+                    let wanted = format!("{tname}_Recorded {n:03}");
+                    // the take goes to the recordings folder right away, so it is never lost
+                    let saved = self.save_take(&d, &wanted);
+                    let name = saved
+                        .as_ref()
+                        .and_then(|p| p.file_name())
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or(format!("{wanted}.wav"));
+                    let cur = self.current;
+                    let fid = self.add_file(name.clone(), saved, d, 32, true, "Record");
+                    self.current = cur.or(Some(fid));
+                    made.push((chans, fid, name.clone(), len));
+                    placed.push((ti, fid, name, len));
+                }
+                if let Some(s) = &mut self.session {
+                    for (ti, fid, name, len) in placed {
                         let cid = s.id();
-                        if let Some(tr) = s.tracks.get_mut(t) {
+                        if let Some(tr) = s.tracks.get_mut(ti) {
                             tr.clips.push(crate::session::Clip {
                                 id: cid,
                                 file_id: fid,
@@ -2804,14 +3029,33 @@ The take is still open; save it with File > Save As."
     pub fn update_prerenders(&mut self) {
         let Some(s) = &self.session else {
             self.prerender.clear();
+            self.prerender_keys = None;
             return;
         };
-        let want: std::collections::HashMap<u64, u64> = s
-            .tracks
-            .iter()
-            .filter(|t| t.prerender)
-            .map(|t| (t.id, self.prerender_key(t)))
-            .collect();
+        // the content hashes only change with the session or its files: worked out once per
+        // change, not every frame (hashing means writing out every pre-rendered track)
+        // ... and with which tracks have Pre-render on (cheap to check every frame)
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for t in s.tracks.iter().filter(|t| t.prerender) {
+            std::hash::Hash::hash(&t.id, &mut h);
+        }
+        std::hash::Hash::hash(&self.files.iter().map(|f| f.version).sum::<u64>(), &mut h);
+        let fv = std::hash::Hasher::finish(&h);
+        let stamp = (s.revision, fv, self.files.len());
+        if self.prerender_keys.as_ref().map(|k| k.0) != Some(stamp) {
+            let want: std::collections::HashMap<u64, u64> = s
+                .tracks
+                .iter()
+                .filter(|t| t.prerender)
+                .map(|t| (t.id, self.prerender_key(t)))
+                .collect();
+            self.prerender_keys = Some((stamp, want));
+        }
+        let want = self
+            .prerender_keys
+            .as_ref()
+            .map(|k| k.1.clone())
+            .unwrap_or_default();
         self.prerender
             .retain(|id, c| want.get(id).is_some_and(|k| *k == c.key));
     }
@@ -2915,7 +3159,7 @@ The take is still open; save it with File > Save As."
             return false;
         };
         let tracks: Vec<crate::session::Track> =
-            s.tracks.iter().filter(|t| t.prerender).cloned().collect();
+            s.tracks.iter().filter(|t| t.prerender && !t.bus).cloned().collect();
         if tracks.is_empty() {
             return false;
         }
@@ -2923,7 +3167,10 @@ The take is still open; save it with File > Save As."
         let n = tracks.len();
         // plan: (re)start caches and set each one's window
         for t in &tracks {
-            let key = self.prerender_key(t);
+            let key = match self.prerender_keys.as_ref().and_then(|k| k.1.get(&t.id)) {
+                Some(k) => *k,
+                None => self.prerender_key(t),
+            };
             let c_end = match self.prerender.get(&t.id) {
                 Some(c) => c.end,
                 None => {
@@ -2941,12 +3188,20 @@ The take is still open; save it with File > Save As."
                 Some(c) => {
                     // the playhead left the rendered stretch (a jump back before it, or
                     // forward past what is rendered): start over where it is now
-                    (!whole && (playhead < c.start - 1e-3 || playhead > c.rendered_to() + 1.0))
+                    // (a render a little behind a playing playhead keeps going: only a real
+                    // jump, more than the "ahead" distance, starts it over)
+                    let jump = (self.prefs.prerender_ahead_s as f64).max(1.0);
+                    (!whole && (playhead < c.start - 1e-3 || playhead > c.rendered_to() + jump))
                         || (whole && c.start > 1e-6)
                 }
             };
             if restart {
-                if let Some(c) = self.prerender_start(t, key, wa) {
+                // a following render starts AT the playhead (what plays next comes first); the
+                // stretch behind it fills in as playback moves on. Starting "behind" first made
+                // a playing playhead outrun the render, so it restarted over and over and never
+                // caught up.
+                let from = if whole { wa } else { playhead.clamp(wa, wb.max(wa)) };
+                if let Some(c) = self.prerender_start(t, key, from) {
                     self.prerender.insert(t.id, c);
                 }
             }
@@ -2997,7 +3252,8 @@ The take is still open; save it with File > Save As."
         busy
     }
 
-    /// Run the pre-renders until they have nothing left to do at the current playhead.
+    /// Run the pre-renders until they have nothing left to do at the current playhead (tests).
+    #[cfg(test)]
     pub fn finish_prerenders(&mut self) {
         let mut guard = 0;
         while self.prerender_tick(std::time::Duration::from_secs(3600)) && guard < 1000 {
@@ -3008,28 +3264,71 @@ The take is still open; save it with File > Save As."
         self.refresh_mix(false);
     }
 
-    /// What the pre-render gauge shows: `None` when no track has Pre-render on.
+    /// What the pre-render gauge shows: `None` when no track has Pre-render on. Pre-render is
+    /// per track: `ready` lists the stretches where the pre-rendered tracks have audio and it is
+    /// already rendered (from a track's first clip to its last, or a tail being rendered past
+    /// it). A finished render shows as a bar the length of those tracks; a render following the
+    /// playhead shows its moving stretch.
     pub fn prerender_gauge(&self) -> Option<PrerenderGauge> {
         let s = self.session.as_ref()?;
-        let ids: Vec<u64> = s
-            .tracks
-            .iter()
-            .filter(|t| t.prerender)
-            .map(|t| t.id)
-            .collect();
-        if ids.is_empty() {
+        let pre: Vec<&crate::session::Track> = s.tracks.iter().filter(|t| t.prerender).collect();
+        if pre.is_empty() {
             return None;
         }
-        let caches: Vec<&PreCache> = ids.iter().filter_map(|id| self.prerender.get(id)).collect();
-        // the stretch every pre-rendered track has ready, and the stretch they aim for
-        let (mut ra, mut rb) = (f64::NEG_INFINITY, f64::INFINITY);
+        let first = s
+            .tracks
+            .iter()
+            .flat_map(|t| t.clips.iter())
+            .map(|c| c.start)
+            .fold(f64::INFINITY, f64::min);
+        let mut last = s
+            .tracks
+            .iter()
+            .flat_map(|t| t.clips.iter())
+            .map(|c| c.end())
+            .fold(0.0f64, f64::max);
+        let first = if first.is_finite() { first } else { 0.0 };
+        let mut missing: Vec<(f64, f64)> = vec![];
         let (mut wa, mut wb) = (f64::INFINITY, f64::NEG_INFINITY);
         let (mut done_n, mut total_n) = (0.0f64, 0.0f64);
         let mut bytes = 0usize;
-        for c in &caches {
+        let mut busy = false;
+        let mut edge: Option<f64> = None;
+        // where pre-rendered tracks have audio at all: only there can the bar be "ready"
+        let mut content: Vec<(f64, f64)> = vec![];
+        for t in &pre {
+            let cs = t.clips.iter().map(|c| c.start).fold(f64::INFINITY, f64::min);
+            let ce = t.clips.iter().map(|c| c.end()).fold(0.0f64, f64::max);
+            if !cs.is_finite() {
+                continue; // no clips: nothing to render
+            }
+            let Some(c) = self.prerender.get(&t.id) else {
+                // not started yet: all of it is still to do
+                content.push((cs, ce));
+                missing.push((cs, ce));
+                busy = true;
+                total_n += (ce - cs).max(1e-3);
+                continue;
+            };
+            // the track's audio runs to its last clip, or on through a tail as it is rendered
+            let shown_end = if c.tail_done {
+                c.end.max(ce)
+            } else {
+                ce.max(c.rendered_to().min(c.end))
+            };
+            last = last.max(shown_end);
+            content.push((cs, shown_end));
             let (a, b) = (c.start, c.rendered_to());
-            ra = ra.max(a);
-            rb = rb.min(b);
+            if b <= a + 1e-9 {
+                missing.push((cs, shown_end));
+            } else {
+                if a > cs {
+                    missing.push((cs, a.min(shown_end)));
+                }
+                if b < shown_end {
+                    missing.push((b.max(cs), shown_end));
+                }
+            }
             let w1 = c.window.1.min(c.end);
             wa = wa.min(c.window.0);
             wb = wb.max(w1);
@@ -3037,33 +3336,38 @@ The take is still open; save it with File > Save As."
             total_n += want;
             done_n += (b.min(w1) - a.max(c.window.0)).clamp(0.0, want);
             bytes += c.frames() * 8;
-        }
-        if caches.len() < ids.len() {
-            // a track hasn't started yet: nothing is ready for all of them
-            total_n += 1.0;
-            rb = ra;
+            if c.wants_more() {
+                busy = true;
+                edge = Some(edge.map_or(b, |e: f64| e.min(b)));
+            }
         }
         if !wa.is_finite() || !wb.is_finite() {
-            wa = 0.0;
-            wb = 0.0;
+            wa = first;
+            wb = last;
         }
-        if !ra.is_finite() {
-            ra = 0.0;
+        let span = (first, last.max(first));
+        // Pre-render is per track: the bar is filled only where the pre-rendered tracks have
+        // audio (before a track's first clip and after its end it stays empty, not "ready")
+        missing.extend(subtract_spans(span, content.clone()));
+        // and the aim is drawn only where those tracks have audio
+        let c0 = content.iter().map(|c| c.0).fold(f64::INFINITY, f64::min);
+        let c1 = content.iter().map(|c| c.1).fold(f64::NEG_INFINITY, f64::max);
+        if c0.is_finite() && c1.is_finite() {
+            wa = wa.max(c0);
+            wb = wb.min(c1);
         }
-        if !rb.is_finite() || rb < ra {
-            rb = ra;
-        }
-        let busy = caches.len() < ids.len() || caches.iter().any(|c| c.wants_more());
         Some(PrerenderGauge {
-            rendered: (ra.max(0.0), rb.max(0.0)),
+            span,
+            ready: subtract_spans(span, missing),
             window: (wa.max(0.0), wb.max(0.0)),
+            edge,
             progress: if total_n > 0.0 {
                 (done_n / total_n).clamp(0.0, 1.0) as f32
             } else {
                 1.0
             },
             busy,
-            tracks: ids.len(),
+            tracks: pre.len(),
             megabytes: bytes as f32 / (1024.0 * 1024.0),
             cap_megabytes: self.prefs.prerender_cap_mb,
         })
@@ -3161,7 +3465,9 @@ The take is still open; save it with File > Save As."
             Mode::Multitrack => self.refresh_mix(false),
         }
         if playing || rec {
-            let follow = self.auto_scroll;
+            // the auto-scroll button, and how the view follows (Preferences > General)
+            let scroll_mode = crate::prefs::auto_scroll_mode();
+            let follow = self.auto_scroll && scroll_mode != 2;
             match self.mode {
                 Mode::Waveform => {
                     if let Some(f) = self.cur_mut() {
@@ -3170,9 +3476,11 @@ The take is still open; save it with File > Save As."
                         }
                         if follow && playing {
                             let w = f.view.1 - f.view.0;
-                            if f.cursor > f.view.1 || f.cursor < f.view.0 {
-                                let a = f.cursor.min((f.data.duration() - w).max(0.0));
-                                f.view = (a, a + w);
+                            let max_start = Some(f.data.duration() - w);
+                            if let Some(v) =
+                                crate::prefs::follow_view(f.view, f.cursor, max_start, scroll_mode)
+                            {
+                                f.view = v;
                             }
                         }
                     }
@@ -3183,17 +3491,21 @@ The take is still open; save it with File > Save As."
                             s.cursor = pos;
                         }
                         if follow && playing {
-                            let w = s.view.1 - s.view.0;
-                            if s.cursor > s.view.1 || s.cursor < s.view.0 {
-                                s.view = (s.cursor, s.cursor + w);
+                            if let Some(v) =
+                                crate::prefs::follow_view(s.view, s.cursor, None, scroll_mode)
+                            {
+                                s.view = v;
                             }
                         }
                     }
                 }
             }
         } else if self.was_playing {
-            // playback ended on its own
+            // playback ended on its own (a punch-in recording ends with it)
             self.was_playing = false;
+            if self.is_recording() {
+                self.stop();
+            }
             if self.return_on_stop {
                 let o = self.play_origin;
                 self.set_mode_cursor(o);
@@ -3210,8 +3522,8 @@ The take is still open; save it with File > Save As."
                 self.note_saved(&path);
                 if let Some(s) = self.session.as_mut() {
                     s.path = Some(path.to_path_buf());
-                    if let Some(stem) = path.file_stem() {
-                        s.name = stem.to_string_lossy().to_string();
+                    if let Some(n) = path.file_name() {
+                        s.name = crate::library::bare_name(&n.to_string_lossy());
                     }
                     s.mark_saved();
                 }
@@ -3225,20 +3537,38 @@ The take is still open; save it with File > Save As."
     pub fn save_session(&mut self, save_as: bool) {
         let Some(s) = &self.session else { return };
         let path = if save_as || s.path.is_none() {
+            // the dialog starts with the bare name (no extension) and the session's current
+            // format first, so picking another format never stacks extensions
+            let current = s
+                .path
+                .as_ref()
+                .and_then(|p| p.extension())
+                .map(|e| e.to_string_lossy().to_ascii_lowercase())
+                .filter(|e| e == "acsession")
+                .unwrap_or_else(|| "sesx".into());
+            let sesx = ("Session XML (*.sesx)", ["sesx"]);
+            let acs = ("AudioCraft session (*.acsession)", ["acsession"]);
+            let (first, second) = if current == "acsession" {
+                (acs, sesx)
+            } else {
+                (sesx, acs)
+            };
             let mut dlg = rfd::FileDialog::new()
-                .add_filter("Session XML (*.sesx)", &["sesx"])
-                .add_filter("AudioCraft session (*.acsession)", &["acsession"])
-                .set_file_name(format!("{}.sesx", s.name));
+                .add_filter(first.0, &first.1)
+                .add_filter(second.0, &second.1)
+                .set_file_name(crate::library::bare_name(&s.name));
             if let Some(d) = self.default_save_dir() {
                 dlg = dlg.set_directory(d);
             }
             match dlg.ask_save() {
-                Some(p) if p.extension().is_some() => p,
-                Some(p) => p.with_extension("sesx"),
+                Some(p) => {
+                    crate::library::clean_save_path(&p, &["sesx", "acsession", "xml"], &current)
+                }
                 None => return,
             }
         } else {
-            s.path.clone().unwrap()
+            let p = s.path.clone().unwrap();
+            crate::library::clean_save_path(&p, &["sesx", "acsession", "xml"], "sesx")
         };
         let dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
         let mut used: Vec<u64> = s
@@ -3324,20 +3654,8 @@ The take is still open; save it with File > Save As."
             self.finish_sesx_save(&path, &copy, &files);
             return;
         }
-        let file = serde_json::json!({
-            "format": "AudioCraft Session 1",
-            "name": s.name,
-            "rate": s.rate,
-            "master_db": s.master_db,
-            "markers": s.markers,
-            "files": paths.iter().map(|(_, p)| p.clone()).collect::<Vec<_>>(),
-            "tracks": tracks,
-            "master": s.master,
-            "metronome": s.metronome,
-            "groups": s.groups,
-            "mix": s.mix,
-            "bits": s.bits,
-        });
+        let files: Vec<String> = paths.iter().map(|(_, p)| p.clone()).collect();
+        let file = session_json(s, &tracks, &files, &dir);
         match audio::write_atomic(
             &path,
             serde_json::to_string_pretty(&file)
@@ -3346,8 +3664,8 @@ The take is still open; save it with File > Save As."
         ) {
             Ok(()) => {
                 s.path = Some(path.clone());
-                if let Some(stem) = path.file_stem() {
-                    s.name = stem.to_string_lossy().to_string();
+                if let Some(n) = path.file_name() {
+                    s.name = crate::library::bare_name(&n.to_string_lossy());
                 }
                 s.mark_saved();
                 self.note_saved(&path);
@@ -3364,6 +3682,7 @@ The take is still open; save it with File > Save As."
             Ok(v) => v,
             Err(e) => return self.message("Could not open session", &e),
         };
+        let rate = s.rate;
         let mut ids = vec![];
         let mut missing = vec![];
         for pb in &files {
@@ -3383,8 +3702,9 @@ The take is still open; save it with File > Save As."
                         self.add_file(name, Some(pb.clone()), lf.data, lf.bits, lf.float, "Open")
                     }
                     Err(_) => {
+                        // keep its clips: an offline placeholder remembers where it belongs
                         missing.push(pb.display().to_string());
-                        0
+                        self.add_offline(pb.clone(), rate)
                     }
                 },
             };
@@ -3396,6 +3716,9 @@ The take is still open; save it with File > Save As."
             }
             t.clips.retain(|c| c.file_id != 0);
         }
+        s.path = s.path.clone().or_else(|| Some(path.to_path_buf()));
+        // a name saved earlier with its extension stacked on ("xyz.sesx") loses it
+        s.name = crate::library::bare_name(&s.name);
         s.view = (0.0, (s.length() * 1.1).max(30.0));
         s.mark_saved();
         self.session_hist = vec![("Open Session".into(), s.hist_state())];
@@ -3404,14 +3727,19 @@ The take is still open; save it with File > Save As."
         self.mode = Mode::Multitrack;
         self.add_recent(path);
         self.refresh_mix(true);
-        if !missing.is_empty() {
-            self.message(
-                "Some media is offline",
-                &format!(
-                    "These files could not be found or opened; their clips were left out:\n\n{}",
-                    missing.join("\n")
-                ),
-            );
+        self.media_offline_notice(missing.len());
+    }
+
+    /// After opening a session with missing media: say so and open Relink Media.
+    fn media_offline_notice(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        self.status = format!("{n} media file(s) offline");
+        if self.screenshot.is_none() {
+            self.open_relink(&format!(
+                "{n} file(s) could not be found where the session expects them. Their clips are kept (silent, marked Offline) until you relink them."
+            ));
         }
     }
 
@@ -3432,7 +3760,11 @@ The take is still open; save it with File > Save As."
             Err(e) => return self.message("Could not open session", &e.to_string()),
         };
         let rate = v["rate"].as_u64().unwrap_or(48000) as u32;
-        let mut s = Session::new(v["name"].as_str().unwrap_or("Session"), rate, 0);
+        let mut s = Session::new(
+            &crate::library::bare_name(v["name"].as_str().unwrap_or("Session")),
+            rate,
+            0,
+        );
         s.master_db = v["master_db"].as_f64().unwrap_or(0.0) as f32;
         s.markers = serde_json::from_value(v["markers"].clone()).unwrap_or_default();
         if let Ok(m) = serde_json::from_value(v["master"].clone()) {
@@ -3451,9 +3783,17 @@ The take is still open; save it with File > Save As."
             s.bits = b as u16;
         }
         let paths: Vec<String> = serde_json::from_value(v["files"].clone()).unwrap_or_default();
+        let rels: Vec<Option<String>> =
+            serde_json::from_value(v["relative_files"].clone()).unwrap_or_default();
+        let dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
         let mut ids = vec![];
-        for p in &paths {
-            let pb = PathBuf::from(p);
+        let mut missing = 0usize;
+        for (i, p) in paths.iter().enumerate() {
+            // relative to the session first (the library may have moved), then the absolute
+            // path it was saved with, then the same name beside the session
+            let rel = rels.get(i).cloned().flatten();
+            let abs = (!p.is_empty()).then(|| PathBuf::from(p));
+            let (pb, found) = crate::library::resolve(&dir, rel.as_deref(), abs.as_deref());
             let existing = self
                 .files
                 .iter()
@@ -3469,7 +3809,11 @@ The take is still open; save it with File > Save As."
                             .unwrap_or_default();
                         self.add_file(name, Some(pb.clone()), lf.data, lf.bits, lf.float, "Open")
                     }
-                    Err(_) => 0,
+                    Err(_) => {
+                        let _ = found;
+                        missing += 1;
+                        self.add_offline(pb.clone(), rate)
+                    }
                 },
             };
             ids.push(id);
@@ -3496,6 +3840,7 @@ The take is still open; save it with File > Save As."
         self.mode = Mode::Multitrack;
         self.add_recent(path);
         self.refresh_mix(true);
+        self.media_offline_notice(missing);
     }
 
     pub fn mixdown(&mut self, selection_only: bool, to_file: bool) {
@@ -4035,12 +4380,16 @@ impl PreCache {
 }
 
 /// The pre-render gauge's state (like a video editor's render bar).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PrerenderGauge {
-    /// The stretch every pre-rendered track has ready (plays from rendered audio).
-    pub rendered: (f64, f64),
+    /// The session's stretch: its first clip's start to its last clip's end (or a tail).
+    pub span: (f64, f64),
+    /// The stretches every pre-rendered track can already play from rendered audio.
+    pub ready: Vec<(f64, f64)>,
     /// The stretch the renders aim to hold now (the whole session, or around the playhead).
     pub window: (f64, f64),
+    /// Where a running render has got to (the moving edge), if one is running.
+    pub edge: Option<f64>,
     /// 0..=1: how much of the window is rendered.
     pub progress: f32,
     /// A render still has work to do.
@@ -4050,4 +4399,209 @@ pub struct PrerenderGauge {
     /// Memory the rendered audio uses, and the cap from Preferences.
     pub megabytes: f32,
     pub cap_megabytes: f32,
+}
+
+/// `span` without the `holes` (which may overlap and come in any order): the stretches left.
+pub fn subtract_spans(span: (f64, f64), mut holes: Vec<(f64, f64)>) -> Vec<(f64, f64)> {
+    holes.retain(|h| h.1 > h.0);
+    holes.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut out = vec![];
+    let mut at = span.0;
+    for (a, b) in holes {
+        if b <= at {
+            continue;
+        }
+        if a > at {
+            out.push((at, a.min(span.1)));
+        }
+        at = at.max(b);
+        if at >= span.1 {
+            break;
+        }
+    }
+    if at < span.1 {
+        out.push((at, span.1));
+    }
+    out.retain(|r: &(f64, f64)| r.1 - r.0 > 1e-6);
+    out
+}
+
+/// The channels of a multichannel recording a track's input picks: one channel for a mono
+/// input ([c, c]), two for a stereo pair.
+pub fn input_take(rec: &AudioData, chans: [usize; 2]) -> AudioData {
+    let last = rec.channels().saturating_sub(1);
+    let (a, b) = (chans[0].min(last), chans[1].min(last));
+    let get = |c: usize| rec.ch.get(c).cloned().unwrap_or_default();
+    let mut d = AudioData::new(rec.rate, if a == b { 1 } else { 2 }, 0);
+    d.ch[0] = get(a);
+    if a != b {
+        d.ch[1] = get(b);
+    }
+    d
+}
+
+/// The content of an AudioCraft session file (`.acsession`): the session with every file it
+/// uses written both absolute and relative to `dir` (with `..` steps, plus the library
+/// folder), so a moved library still opens.
+pub fn session_json(
+    s: &Session,
+    tracks: &[Track],
+    files: &[String],
+    dir: &std::path::Path,
+) -> serde_json::Value {
+    let abs: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
+    let rel: Vec<Option<String>> = abs
+        .iter()
+        .map(|p| crate::library::relative(dir, p))
+        .collect();
+    let lib = crate::library::relative(dir, &crate::library::library_root(dir, &abs));
+    serde_json::json!({
+        "format": "AudioCraft Session 1",
+        "name": s.name,
+        "rate": s.rate,
+        "master_db": s.master_db,
+        "markers": s.markers,
+        "files": files,
+        "relative_files": rel,
+        "library_folder": lib,
+        "tracks": tracks,
+        "master": s.master,
+        "metronome": s.metronome,
+        "groups": s.groups,
+        "mix": s.mix,
+        "bits": s.bits,
+    })
+}
+
+impl App {
+    /// Preferences > Auto Save: every N minutes a changed session gets a backup copy, in a
+    /// `Backups` folder beside the session (or in the app's own folder for a session never
+    /// saved), keeping only the newest few. Runs every frame; cheap until a backup is due.
+    pub fn autosave_tick(&mut self) {
+        if !self.prefs.autosave_on || self.screenshot.is_some() {
+            return;
+        }
+        let every =
+            std::time::Duration::from_secs(60 * self.prefs.autosave_minutes.clamp(1, 120) as u64);
+        let now = std::time::Instant::now();
+        let due = match self.autosave_at {
+            Some(t) => now.duration_since(t) >= every,
+            None => {
+                self.autosave_at = Some(now);
+                false
+            }
+        };
+        if !due {
+            return;
+        }
+        self.autosave_at = Some(now);
+        let Some(s) = self.session.as_ref() else {
+            return;
+        };
+        if s.tracks.iter().all(|t| t.clips.is_empty()) {
+            return;
+        }
+        let fp = s.content_fp();
+        if !s.dirty || self.autosave_fp == Some(fp) {
+            return;
+        }
+        match self.write_backup() {
+            Ok(p) => {
+                self.autosave_fp = Some(fp);
+                self.status = format!("Backup saved: {}", p.display());
+            }
+            Err(e) => self.status = format!("Backup not saved: {e}"),
+        }
+    }
+
+    /// Write a backup copy of the session now (see [`App::autosave_tick`]); the path written.
+    /// Audio that was never saved has no place on disk, so its clips are left out of the copy
+    /// (the file lists them under `unsaved_files_left_out`).
+    pub fn write_backup(&self) -> Result<PathBuf, String> {
+        let s = self.session.as_ref().ok_or("no session is open")?;
+        let dir = match s.path.as_ref().and_then(|p| p.parent()) {
+            Some(d) => d.join("Backups"),
+            None => crate::prefs::config_dir()
+                .ok_or("no folder for backups")?
+                .join("Backups"),
+        };
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let mut used: Vec<u64> = s
+            .tracks
+            .iter()
+            .flat_map(|t| t.clips.iter().map(|c| c.file_id))
+            .collect();
+        used.sort_unstable();
+        used.dedup();
+        let mut files: Vec<String> = vec![];
+        let mut index: std::collections::HashMap<u64, u64> = Default::default();
+        let mut unsaved: Vec<String> = vec![];
+        for id in used {
+            match self.file(id).and_then(|f| f.path.clone()) {
+                Some(p) => {
+                    index.insert(id, files.len() as u64);
+                    files.push(p.to_string_lossy().to_string());
+                }
+                None => unsaved.push(self.file(id).map(|f| f.name.clone()).unwrap_or_default()),
+            }
+        }
+        let mut tracks = s.tracks.clone();
+        for t in tracks.iter_mut() {
+            t.clips.retain(|c| index.contains_key(&c.file_id));
+            for c in t.clips.iter_mut() {
+                c.file_id = index.get(&c.file_id).copied().unwrap_or(0);
+            }
+        }
+        let mut v = session_json(s, &tracks, &files, &dir);
+        if !unsaved.is_empty() {
+            v["unsaved_files_left_out"] = serde_json::json!(unsaved);
+        }
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let (day, t) = (secs / 86_400, secs % 86_400);
+        let stamp = format!("{day}-{:02}{:02}{:02}", t / 3600, t / 60 % 60, t % 60);
+        let stem = crate::library::bare_name(&s.name);
+        let prefix = format!("{stem}_backup_");
+        let mut path = dir.join(format!("{prefix}{stamp}.acsession"));
+        let mut k = 2;
+        while path.exists() {
+            path = dir.join(format!("{prefix}{stamp}_{k}.acsession"));
+            k += 1;
+        }
+        audio::write_atomic(
+            &path,
+            serde_json::to_string_pretty(&v).unwrap_or_default().as_bytes(),
+        )?;
+        // keep the newest backups only
+        let keep = self.prefs.autosave_keep.clamp(1, 100) as usize;
+        let mut olds: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(&dir)
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        p.file_name()
+                            .map(|n| {
+                                let n = n.to_string_lossy();
+                                n.starts_with(&prefix) && n.ends_with(".acsession")
+                            })
+                            .unwrap_or(false)
+                    })
+                    .map(|p| {
+                        let t = std::fs::metadata(&p)
+                            .and_then(|m| m.modified())
+                            .unwrap_or(std::time::UNIX_EPOCH);
+                        (t, p)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        olds.sort();
+        while olds.len() > keep {
+            let (_, p) = olds.remove(0);
+            let _ = std::fs::remove_file(p);
+        }
+        Ok(path)
+    }
 }

@@ -96,6 +96,20 @@ pub struct Prefs {
     /// render fits its share, the whole session is rendered; otherwise a window follows the
     /// playhead.
     pub prerender_cap_mb: f32,
+    /// MCP: AI assistants may connect (Preferences > Control Surface). Off until turned on.
+    pub mcp_enabled: bool,
+    /// The local port the MCP server listens on (127.0.0.1 only).
+    pub mcp_port: u16,
+    /// The secret every MCP request must carry (made when MCP is first turned on).
+    pub mcp_token: String,
+    /// 0 read only, 1 navigate & play, 2 edit, 3 full (also saving).
+    pub mcp_level: u8,
+    /// Changes wait for the person's Allow / Deny.
+    pub mcp_confirm: bool,
+    /// Most MCP tool calls a minute.
+    pub mcp_rate_per_min: u32,
+    /// The snapping line's own colour (Preferences > Multitrack); `None`: the theme's.
+    pub snap_line_color: Option<[u8; 3]>,
     /// Seconds a following pre-render keeps ready in front of the playhead.
     pub prerender_ahead_s: f32,
     /// Seconds a following pre-render keeps behind the playhead.
@@ -212,6 +226,13 @@ impl Default for Prefs {
             sesx_bake_tolerance_db: 0.25,
             pre_render_tracks: false,
             prerender_cap_mb: 1024.0,
+            snap_line_color: None,
+            mcp_enabled: false,
+            mcp_port: 17_345,
+            mcp_token: String::new(),
+            mcp_level: 1,
+            mcp_confirm: true,
+            mcp_rate_per_min: 60,
             prerender_ahead_s: 30.0,
             prerender_behind_s: 10.0,
             prerender_max_tail_s: 30.0,
@@ -310,6 +331,149 @@ static IO_BUTTON_PX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32
 pub const UNDO_MEMORY_BUDGET: usize = 3 << 30;
 
 static FPS_X100: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(3000);
+static HISTORY_LIMIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(100);
+static LANE_HEIGHT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(120);
+static PRE_RENDER_DEFAULT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static AUTO_CROSSFADE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static AUTO_SCROLL_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static DITHER_X100: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static CLIP_FLOAT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SMOOTH_MS_X10: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static FX_MIX_PCT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(100);
+static SMOOTH_FADE_POINTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static XFADE_CURVE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static PLAY_OVERLAP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static SAVE_PEAKS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static CACHE_MB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(10 * 1024);
+static TEMP_FOLDER: std::sync::RwLock<String> = std::sync::RwLock::new(String::new());
+
+/// Curves are drawn smoothly through fade points that have no handles of their own
+/// (Preferences > Multitrack Clips > Smooth curves through fade points).
+pub fn smooth_fade_points() -> bool {
+    SMOOTH_FADE_POINTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The shape of automatic crossfades: 0 equal power, 1 linear, 2 logarithmic
+/// (Preferences > Multitrack Clips > Default crossfade curve).
+pub fn crossfade_curve() -> u8 {
+    XFADE_CURVE.load(std::sync::atomic::Ordering::Relaxed).min(2)
+}
+
+/// Clips under a later clip still sound (Preferences > Multitrack Clips > Play overlapped
+/// portions of clips). Off: where a clip lies on top of another without a crossfade, only the
+/// top one is heard.
+pub fn play_overlap() -> bool {
+    PLAY_OVERLAP.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Waveform peaks are kept in the media cache (Preferences > Media & Disk Cache).
+pub fn save_peak_files() -> bool {
+    SAVE_PEAKS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The media cache's size limit in bytes.
+pub fn cache_limit_bytes() -> u64 {
+    CACHE_MB.load(std::sync::atomic::Ordering::Relaxed) * 1024 * 1024
+}
+
+/// The folder for AudioCraft's temporary files and media cache (Preferences > Media & Disk
+/// Cache > Temporary folder; the system's when none is chosen or it can't be used).
+pub fn temp_dir() -> PathBuf {
+    let chosen = TEMP_FOLDER.read().map(|s| s.trim().to_string()).unwrap_or_default();
+    if !chosen.is_empty() && !cfg!(test) {
+        let p = PathBuf::from(chosen);
+        if std::fs::create_dir_all(&p).is_ok() {
+            return p;
+        }
+    }
+    std::env::temp_dir()
+}
+
+/// Dither added when audio is written at 8, 16 or 24 bits, in least-significant bits (0: off;
+/// Preferences > Data).
+pub fn dither_lsb() -> f32 {
+    DITHER_X100.load(std::sync::atomic::Ordering::Relaxed) as f32 / 100.0
+}
+
+/// Clip 32-bit float files above 0 dBFS when they are opened (Preferences > Data).
+pub fn clip_float_on_open() -> bool {
+    CLIP_FLOAT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Frames of crossfade at a delete or cut seam in the Waveform editor (0: a plain cut;
+/// Preferences > Data > Smooth delete and cut boundaries).
+pub fn smooth_delete_frames(rate: u32) -> usize {
+    let ms = SMOOTH_MS_X10.load(std::sync::atomic::Ordering::Relaxed) as f64 / 10.0;
+    (ms / 1000.0 * rate as f64).round() as usize
+}
+
+/// The mix (0..=1) a newly added effect starts with (Preferences > Effects).
+pub fn fx_default_mix() -> f32 {
+    FX_MIX_PCT.load(std::sync::atomic::Ordering::Relaxed).min(100) as f32 / 100.0
+}
+
+/// How many undo steps a multitrack session keeps (Preferences > Memory > History limit).
+pub fn history_limit() -> usize {
+    HISTORY_LIMIT.load(std::sync::atomic::Ordering::Relaxed).clamp(2, 100_000)
+}
+
+/// Height of a new track's automation lane (Preferences > Multitrack > Automation lane height).
+pub fn lane_height() -> f32 {
+    LANE_HEIGHT.load(std::sync::atomic::Ordering::Relaxed) as f32
+}
+
+/// New tracks start with Pre-render on (Preferences > Multitrack).
+pub fn pre_render_default() -> bool {
+    PRE_RENDER_DEFAULT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Overlapping clips get an automatic crossfade (Preferences > Multitrack Clips).
+pub fn auto_crossfade() -> bool {
+    AUTO_CROSSFADE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// How the view follows playback (Preferences > General): 0 page by page, 1 centred, 2 off.
+pub fn auto_scroll_mode() -> u8 {
+    AUTO_SCROLL_MODE.load(std::sync::atomic::Ordering::Relaxed).min(2)
+}
+
+/// Where the view should move so the playhead stays in sight while playing, or `None` to
+/// leave it: page by page (a new page when the playhead leaves the view), centred (the
+/// playhead held in the middle once it passes it), or never. `max_start`, when known, is the
+/// furthest the view may start (a file's end minus the view's width).
+pub fn follow_view(view: (f64, f64), cursor: f64, max_start: Option<f64>, mode: u8) -> Option<(f64, f64)> {
+    let w = view.1 - view.0;
+    if !(w > 0.0) {
+        return None;
+    }
+    let clamp = |a: f64| {
+        let a = a.max(0.0);
+        match max_start {
+            Some(m) => a.min(m.max(0.0)),
+            None => a,
+        }
+    };
+    match mode {
+        2 => None,
+        1 => {
+            let mid = view.0 + w * 0.5;
+            if cursor > mid + 1e-9 || cursor < view.0 {
+                let a = clamp(cursor - w * 0.5);
+                ((a - view.0).abs() > 1e-9).then_some((a, a + w))
+            } else {
+                None
+            }
+        }
+        _ => {
+            if cursor > view.1 || cursor < view.0 {
+                let a = clamp(cursor);
+                Some((a, a + w))
+            } else {
+                None
+            }
+        }
+    }
+}
 
 pub fn set_live(p: &Prefs) {
     use std::sync::atomic::Ordering::Relaxed;
@@ -327,6 +491,48 @@ pub fn set_live(p: &Prefs) {
         30.0
     };
     FPS_X100.store((fps * 100.0).round() as u32, Relaxed);
+    HISTORY_LIMIT.store(p.history_limit.clamp(2, 100_000) as usize, Relaxed);
+    let lane = if p.default_lane_height.is_finite() {
+        p.default_lane_height.clamp(40.0, 400.0)
+    } else {
+        120.0
+    };
+    LANE_HEIGHT.store(lane.round() as u32, Relaxed);
+    PRE_RENDER_DEFAULT.store(p.pre_render_tracks, Relaxed);
+    AUTO_CROSSFADE.store(p.auto_crossfade, Relaxed);
+    AUTO_SCROLL_MODE.store(p.auto_scroll_mode.min(2), Relaxed);
+    let dither = if p.dither_on && p.dither_depth.is_finite() {
+        (p.dither_depth.clamp(0.0, 4.0) * 100.0).round() as u32
+    } else {
+        0
+    };
+    DITHER_X100.store(dither, Relaxed);
+    CLIP_FLOAT.store(p.interpret_float_clip, Relaxed);
+    let smooth = if p.smooth_edit_crossfade && p.smooth_delete_ms.is_finite() {
+        (p.smooth_delete_ms.clamp(0.0, 200.0) * 10.0).round() as u32
+    } else {
+        0
+    };
+    SMOOTH_MS_X10.store(smooth, Relaxed);
+    let mix = if p.fx_default_mix.is_finite() {
+        p.fx_default_mix.clamp(0.0, 100.0).round() as u32
+    } else {
+        100
+    };
+    FX_MIX_PCT.store(mix, Relaxed);
+    SMOOTH_FADE_POINTS.store(p.clip_fade_points_smooth, Relaxed);
+    XFADE_CURVE.store(p.default_crossfade_curve.min(2), Relaxed);
+    PLAY_OVERLAP.store(p.play_overlap, Relaxed);
+    SAVE_PEAKS.store(p.save_peak_files, Relaxed);
+    let gb = if p.cache_limit_gb.is_finite() {
+        p.cache_limit_gb.clamp(0.1, 1000.0)
+    } else {
+        10.0
+    };
+    CACHE_MB.store((gb * 1024.0) as u64, Relaxed);
+    if let Ok(mut t) = TEMP_FOLDER.write() {
+        *t = p.temp_folder.clone();
+    }
 }
 
 /// Frames per second of the SMPTE time display (Preferences > Time Display).

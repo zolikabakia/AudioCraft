@@ -349,6 +349,56 @@ pub struct Track {
     /// The automation lane's pan envelope, handles and settings.
     #[serde(default)]
     pub auto: TrackAuto,
+    /// A bus track: other tracks' sends and outputs feed it, and it goes on to the Master.
+    #[serde(default)]
+    pub bus: bool,
+}
+
+/// A track's routing to a bus is kept by the bus's id ("bus:<id>"), so renaming a bus never
+/// breaks it. The bus id a routing name points at, if it is one.
+pub fn bus_ref(name: &str) -> Option<u64> {
+    name.strip_prefix("bus:")?.trim().parse().ok()
+}
+
+impl Session {
+    /// The routing name of bus track `id`.
+    pub fn bus_name_for(id: u64) -> String {
+        format!("bus:{id}")
+    }
+
+    /// How a track output or send target is shown: a bus by its track's name.
+    pub fn route_label(&self, name: &str) -> String {
+        match bus_ref(name) {
+            Some(id) => self
+                .tracks
+                .iter()
+                .find(|t| t.id == id && t.bus)
+                .map(|t| t.name.clone())
+                .unwrap_or_else(|| "(missing bus)".into()),
+            None => name.to_string(),
+        }
+    }
+
+    /// The bus tracks: (id, name).
+    pub fn busses(&self) -> Vec<(u64, String)> {
+        self.tracks
+            .iter()
+            .filter(|t| t.bus)
+            .map(|t| (t.id, t.name.clone()))
+            .collect()
+    }
+
+    /// Add a stereo bus track (after the other tracks).
+    pub fn add_bus(&mut self) -> usize {
+        let n = self.tracks.iter().filter(|t| t.bus).count();
+        let i = self.add_track(true);
+        let t = &mut self.tracks[i];
+        t.bus = true;
+        t.name = format!("Bus {}", n + 1);
+        t.prerender = false;
+        t.send.level_db = -96.0;
+        i
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -671,19 +721,6 @@ impl Session {
         }
     }
 
-    /// Move the other clips of `id`'s group by `delta` seconds (none before 0).
-    pub fn shift_group(&mut self, id: u64, delta: f64) {
-        if delta == 0.0 {
-            return;
-        }
-        let others: Vec<u64> = self.group_of(id).into_iter().filter(|c| *c != id).collect();
-        for c in others {
-            if let Some(cl) = self.clip_mut(c) {
-                cl.start = (cl.start + delta).max(0.0);
-            }
-        }
-    }
-
     pub fn id(&mut self) -> u64 {
         self.next_id += 1;
         self.next_id
@@ -918,7 +955,8 @@ impl Session {
             clips: vec![],
             rack: vec![],
             fx: RackOpts::default(),
-            prerender: false,
+            // Preferences > Multitrack: new tracks may start pre-rendered
+            prerender: crate::prefs::pre_render_default(),
             color: TRACK_COLORS[n % TRACK_COLORS.len()],
             height: crate::prefs::track_height(),
             io: TrackIo::default(),
@@ -930,7 +968,11 @@ impl Session {
             hidden: false,
             vol_env: vec![],
             show_vol_env: false,
-            auto: Default::default(),
+            auto: TrackAuto {
+                lane_h: crate::prefs::lane_height(),
+                ..Default::default()
+            },
+            bus: false,
         });
         self.touch();
         n
@@ -1010,6 +1052,13 @@ impl Session {
         pre: &dyn Fn(u64) -> Option<PreRange>,
     ) -> Mix {
         let any_solo = self.tracks.iter().any(|t| t.solo);
+        // a bus id -> its index in the mix (busses are mixed after the tracks feeding them)
+        let bus_at = |name: &str, own: u64| -> Option<usize> {
+            let id = bus_ref(name)?;
+            (id != own)
+                .then(|| self.tracks.iter().position(|b| b.id == id && b.bus))
+                .flatten()
+        };
         let tracks = self
             .tracks
             .iter()
@@ -1020,13 +1069,16 @@ impl Session {
                 let (clips, rack, fx): (Vec<MixClip>, Vec<EffectSlot>, RackOpts) = {
                     {
                         let fades = effective_fades(t);
+                        let hidden = hidden_ranges(t, &fades);
                         let clips = t
                             .clips
                             .iter()
                             .zip(fades)
-                            .filter(|(c, _)| !c.muted)
-                            .filter_map(|(c, (fin, fout, xin, xout))| {
+                            .zip(hidden)
+                            .filter(|((c, _), _)| !c.muted)
+                            .filter_map(|((c, (fin, fout, xin, xout)), hidden)| {
                                 Some(MixClip {
+                                    hidden,
                                     data: lookup(c.file_id)?,
                                     start: c.start,
                                     offset: c.offset,
@@ -1041,12 +1093,12 @@ impl Session {
                                     pan_env: c.baked_pan(0.001),
                                     // shaping points win; otherwise the handle's up/down shape
                                     fin_curve: if c.curves.fin_pts.is_empty() {
-                                        shape_table(xin, c.curves.fin_shape)
+                                        default_fade_table(xin, c.curves.fin_shape)
                                     } else {
                                         fade_table(&c.curves.fin_pts, &c.curves.fin_h)
                                     },
                                     fout_curve: if c.curves.fout_pts.is_empty() {
-                                        shape_table(xout, c.curves.fout_shape)
+                                        default_fade_table(xout, c.curves.fout_shape)
                                     } else {
                                         fade_table(&c.curves.fout_pts, &c.curves.fout_h)
                                     },
@@ -1077,7 +1129,9 @@ impl Session {
                     clips,
                     gain_l: polarity * vol * (1.0 - pan).min(1.0),
                     gain_r: polarity * vol * (1.0 + pan).min(1.0),
-                    audible: !t.mute && (!any_solo || t.solo),
+                    // a track sent nowhere ("None") is silent; busses stay audible while
+                    // other tracks are soloed (they carry the soloed tracks' sends)
+                    audible: !t.mute && (t.bus || !any_solo || t.solo) && t.io.output != "None",
                     rack,
                     fx,
                     mono: !t.stereo,
@@ -1088,6 +1142,16 @@ impl Session {
                     polarity,
                     extra: track_mix_auto(t, rack_len_before_eq),
                     pre: pre_range,
+                    direct: output_pair(&t.io.output),
+                    bus: t.bus,
+                    // busses go to the Master (one level of busses: no loops)
+                    to_bus: if t.bus { None } else { bus_at(&t.io.output, t.id) },
+                    send: if t.bus || !t.send.on {
+                        None
+                    } else {
+                        bus_at(&t.send.target, t.id)
+                            .map(|b| (b, undb(t.send.level_db), t.send.pre_fader))
+                    },
                 }
             })
             .collect();
@@ -1180,6 +1244,10 @@ pub fn effective_fades(t: &Track) -> Vec<(f64, f64, bool, bool)> {
         .iter()
         .map(|c| (c.fade_in, c.fade_out, false, false))
         .collect();
+    // Preferences > Multitrack Clips > Automatic crossfades: off keeps plain fades only
+    if !crate::prefs::auto_crossfade() {
+        return v;
+    }
     for (i, a) in t.clips.iter().enumerate() {
         for (j, b) in t.clips.iter().enumerate() {
             if i == j || a.muted || b.muted {
@@ -1285,6 +1353,73 @@ pub struct MixClip {
     /// Fades shaped by points (empty: the plain curve).
     pub fin_curve: Vec<(f64, f32)>,
     pub fout_curve: Vec<(f64, f32)>,
+    /// Stretches of session time where this clip lies under a later one and is not heard
+    /// (Preferences > Multitrack Clips > Play overlapped portions of clips, off).
+    pub hidden: Vec<(f64, f64)>,
+}
+
+/// A fade's table when it has no points: its own shape, or for an unshaped crossfade the
+/// default crossfade curve (Preferences > Multitrack Clips): equal power is the built-in
+/// curve (empty table), linear and logarithmic are tables.
+pub fn default_fade_table(crossfade: bool, shape: f32) -> Vec<(f64, f32)> {
+    if crossfade && (!shape.is_finite() || shape.abs() < 1e-3) {
+        match crate::prefs::crossfade_curve() {
+            1 => return vec![(0.0, 0.0), (1.0, 1.0)],
+            2 => {
+                // even steps in decibels from -48 dB, then down to silence at the very start
+                return (0..=32)
+                    .map(|k| {
+                        let x = k as f64 / 32.0;
+                        let g = if k == 0 {
+                            0.0
+                        } else {
+                            10f32.powf(((x as f32) - 1.0) * 48.0 / 20.0)
+                        };
+                        (x, g)
+                    })
+                    .collect();
+            }
+            _ => {}
+        }
+    }
+    shape_table(crossfade, shape)
+}
+
+/// For each clip of a track, where it is hidden under a later clip that is not crossfaded
+/// with it, when overlapped portions are not played (otherwise nothing is hidden). The later
+/// start is on top; for the same start, the one later in the list.
+pub fn hidden_ranges(t: &Track, fades: &[(f64, f64, bool, bool)]) -> Vec<Vec<(f64, f64)>> {
+    let mut out = vec![vec![]; t.clips.len()];
+    if crate::prefs::play_overlap() {
+        return out;
+    }
+    for (i, a) in t.clips.iter().enumerate() {
+        if a.muted {
+            continue;
+        }
+        for (j, b) in t.clips.iter().enumerate() {
+            if i == j || b.muted {
+                continue;
+            }
+            let on_top = b.start > a.start + 1e-9 || ((b.start - a.start).abs() <= 1e-9 && j > i);
+            if !on_top {
+                continue;
+            }
+            let (s, e) = (b.start.max(a.start), b.end().min(a.end()));
+            if e <= s + 1e-9 {
+                continue;
+            }
+            // a crossfade between the two plays both, as it should
+            let crossfaded = fades.get(i).map(|f| f.3).unwrap_or(false)
+                && fades.get(j).map(|f| f.2).unwrap_or(false)
+                && b.start > a.start
+                && b.end() > a.end();
+            if !crossfaded {
+                out[i].push((s, e));
+            }
+        }
+    }
+    out
 }
 
 pub struct MixTrack {
@@ -1308,7 +1443,29 @@ pub struct MixTrack {
     /// The track's pre-rendered audio (clips and effects before the fader), played instead of
     /// the live clips and rack for every block it covers.
     pub pre: Option<PreRange>,
+    /// Played straight out of a hardware output pair (its first channel, 0-based) instead of
+    /// through the Master. Only live playback routes it; mixdowns and exports keep every track.
+    pub direct: Option<usize>,
+    /// A bus track: mixed after the others, with what they feed it added to its own clips.
+    pub bus: bool,
+    /// The bus (its index in the mix) this track's output goes to instead of the Master.
+    pub to_bus: Option<usize>,
+    /// The send: (bus index, gain, before the fader).
+    pub send: Option<(usize, f32, bool)>,
 }
+
+/// The hardware output pair a track output name picks ("Out 3/4" -> channel 2), if any.
+pub fn output_pair(name: &str) -> Option<usize> {
+    let n = name.trim().to_ascii_lowercase();
+    let rest = n.strip_prefix("out ")?;
+    let first: usize = rest.split('/').next()?.trim().parse().ok()?;
+    (first >= 1).then(|| first - 1)
+}
+
+/// A track's volume range in dB, the same everywhere it can be set: the track header's knob,
+/// the Properties panel, the mixer's fader and the MCP assistants' set_track tool.
+pub const TRACK_DB_MIN: f32 = -60.0;
+pub const TRACK_DB_MAX: f32 = 15.0;
 
 /// Frames in one shared piece of a pre-render (two render blocks).
 pub const PRE_CHUNK: usize = 8192;
@@ -1438,9 +1595,24 @@ pub struct ChainCache {
     pub rate: f32,
     cbuf: Vec<Vec<f32>>,
     dry: Vec<Vec<f32>>,
+    /// Live playback only: tracks with a hardware output pair go into `direct` (one buffer per
+    /// device channel) instead of the Master. Offline renders leave this off, so a mixdown or
+    /// an export always holds every track.
+    pub route_direct: bool,
+    pub direct: Vec<Vec<f32>>,
+    /// What each bus receives this block (by its index in the mix).
+    pub bus_in: Vec<[Vec<f32>; 2]>,
 }
 
 impl ChainCache {
+    /// The live playback cache: it routes tracks sent to hardware outputs.
+    pub fn live() -> Self {
+        ChainCache {
+            route_direct: true,
+            ..ChainCache::default()
+        }
+    }
+
     /// Clear every track, clip and master effect's held sound (see `Chain::flush`).
     pub fn flush(&mut self) {
         for (_, c) in self.chains.iter_mut() {
@@ -1511,14 +1683,59 @@ pub fn render_mix(
     }
     tmp.resize(2, vec![]);
     track_peaks.resize(mix.tracks.len(), [0.0; 2]);
+    if cache.route_direct {
+        let need = mix
+            .tracks
+            .iter()
+            .filter_map(|t| t.direct)
+            .map(|c| c + 2)
+            .max()
+            .unwrap_or(0);
+        cache.direct.resize(need, vec![]);
+        for b in cache.direct.iter_mut() {
+            b.clear();
+            b.resize(n, 0.0);
+        }
+    }
     let dt = 1.0 / rate as f64;
     let t1 = t0 + n as f64 * dt;
-    for (ti, t) in mix.tracks.iter().enumerate() {
+    // busses last, so everything sent to them this block is in
+    let any_bus = mix.tracks.iter().any(|t| t.bus);
+    if any_bus {
+        cache.bus_in.resize(mix.tracks.len(), [vec![], vec![]]);
+        for b in cache.bus_in.iter_mut() {
+            for c in b.iter_mut() {
+                c.clear();
+                c.resize(n, 0.0);
+            }
+        }
+    }
+    let order: Vec<usize> = if any_bus {
+        (0..mix.tracks.len())
+            .filter(|i| !mix.tracks[*i].bus)
+            .chain((0..mix.tracks.len()).filter(|i| mix.tracks[*i].bus))
+            .collect()
+    } else {
+        (0..mix.tracks.len()).collect()
+    };
+    for ti in order {
+        let t = &mix.tracks[ti];
         for c in tmp.iter_mut() {
             c.clear();
             c.resize(n, 0.0);
         }
         let mut any = false;
+        // a bus starts with what the other tracks sent it this block
+        if t.bus {
+            if let Some(b) = cache.bus_in.get(ti) {
+                for k in 0..2 {
+                    for i in 0..n {
+                        tmp[k][i] = b[k][i];
+                    }
+                }
+                any = b.iter().any(|c| c.iter().any(|v| *v != 0.0));
+            }
+        }
         // a pre-rendered stretch covering this block replaces the live clips and rack
         let use_pre = t.pre.as_ref().filter(|p| p.covers(t0, t1));
         if let Some(pr) = use_pre {
@@ -1552,6 +1769,9 @@ pub fn render_mix(
                 let tt = t0 + i as f64 * dt;
                 let rel = tt - c.start;
                 if rel < 0.0 || rel >= c.len {
+                    continue;
+                }
+                if !c.hidden.is_empty() && c.hidden.iter().any(|(a, b)| tt >= *a && tt < *b) {
                     continue;
                 }
                 let mut g = c.gain;
@@ -1666,11 +1886,34 @@ pub fn render_mix(
             };
             let l = tmp[0][i] * gl * ag;
             let r = tmp[1][i] * gr * ag;
+            // the send: before the fader (the track's sound as its effects leave it) or after
+            if let Some((b, g, pre_send)) = t.send {
+                if let Some(bus) = cache.bus_in.get_mut(b) {
+                    let (sl, sr) = if pre_send { (tmp[0][i], tmp[1][i]) } else { (l, r) };
+                    bus[0][i] += sl * g;
+                    bus[1][i] += sr * g;
+                }
+            }
 
             pk[0] = pk[0].max(l.abs());
             pk[1] = pk[1].max(r.abs());
-            out[0][i] += l;
-            out[1][i] += r;
+            // a track sent straight to a hardware pair skips the Master (live playback only)
+            if let Some(bus) = t.to_bus.and_then(|b| cache.bus_in.get_mut(b)) {
+                // the whole track goes into a bus
+                bus[0][i] += l;
+                bus[1][i] += r;
+                continue;
+            }
+            match t.direct.filter(|c| cache.route_direct && c + 1 < cache.direct.len()) {
+                Some(c0) => {
+                    cache.direct[c0][i] += l;
+                    cache.direct[c0 + 1][i] += r;
+                }
+                None => {
+                    out[0][i] += l;
+                    out[1][i] += r;
+                }
+            }
         }
         track_peaks[ti] = pk;
     }
@@ -1825,23 +2068,9 @@ impl MixRender {
         self.done >= self.total
     }
 
-    /// How much of the range is rendered, 0..=1 (an empty range counts as done).
-    pub fn progress(&self) -> f32 {
-        if self.total == 0 {
-            1.0
-        } else {
-            (self.done as f64 / self.total as f64).clamp(0.0, 1.0) as f32
-        }
-    }
-
     /// Session time (seconds) the render has reached.
     pub fn reached(&self) -> f64 {
         self.a + self.done as f64 / self.rate as f64
-    }
-
-    /// Session time (seconds) where the render ends.
-    pub fn end(&self) -> f64 {
-        self.a + self.total as f64 / self.rate as f64
     }
 
     pub fn finish(self) -> AudioData {

@@ -22,8 +22,11 @@ mod icon;
 mod imports;
 mod keys;
 mod lanes;
+mod library;
 mod layout;
 mod lucide;
+mod mcp;
+mod peakcache;
 mod menus;
 mod menus_more;
 mod panels;
@@ -34,6 +37,7 @@ mod prefs_ui;
 mod probe;
 mod procs;
 mod rack;
+mod relink;
 mod session;
 mod sesx;
 mod spectral;
@@ -60,11 +64,12 @@ const HELP: &str = "AudioCraft - audio editor and multitrack mixer
 Usage:
   audiocraft [files...]                      open files in the editor
   audiocraft --list-commands                 print every command (id, title, shortcut, doc) as JSON
+  audiocraft --mcp-stdio                     MCP bridge for AI assistants (stdin/stdout) to the running app
   audiocraft --inspect-session FILE.sesx     print what a session imports as (tracks, clips, fades, effects)
   audiocraft --batch IN --do STEP [--do STEP...] [--out OUT.wav]
                                              process a file without opening a window
   audiocraft --screenshot OUT.png [--demo] [--multitrack | --mixer | --spectral]
-                                             [--fxshot EFFECT] [--shot-dialog file|session|close|prefs] [--autoshot]
+                                             [--fxshot EFFECT] [--shot-dialog file|session|close|prefs|color] [--autoshot]
                                              open a panel or dialog (diagnostic);
                                              --autoshot opens volume automation lanes for the shot
 
@@ -108,8 +113,15 @@ fn main() -> eframe::Result<()> {
                 }
                 plugins::finish_without_teardown();
             }
+            "--mcp-stdio" => {
+                // the MCP bridge for assistants that start a program: stdin/stdout to the
+                // running AudioCraft (Preferences > Control Surface > MCP)
+                std::process::exit(mcp::stdio_bridge());
+            }
             "--list-commands" => {
-                println!("{}", commands::list_json());
+                // a closed pipe (`| head`) ends the listing quietly instead of panicking
+                use std::io::Write;
+                let _ = writeln!(std::io::stdout(), "{}", commands::list_json());
                 return Ok(());
             }
             "--help" | "-h" => {
@@ -236,6 +248,14 @@ fn main() -> eframe::Result<()> {
         .with_min_inner_size([960.0, 600.0]);
     if screenshot.is_some() {
         viewport = viewport.with_active(false);
+        // diagnostic: AUDIOCRAFT_SHOT_WIDTH=960 takes the picture of a narrower window
+        if let Some(w) = std::env::var("AUDIOCRAFT_SHOT_WIDTH")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .filter(|w| w.is_finite() && *w >= 960.0)
+        {
+            viewport = viewport.with_inner_size([w, 880.0]);
+        }
         #[cfg(windows)]
         {
             viewport = viewport.with_window_level(egui::WindowLevel::AlwaysOnBottom);

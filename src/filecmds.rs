@@ -52,6 +52,18 @@ pub const MORE_COMMANDS: &[Cmd] = more![
         "Close the file selected in the Files list, asking first if it has unsaved changes."
     ),
     (
+        "transport.play_preroll",
+        "Play with Pre-roll and Post-roll",
+        "Ctrl+Shift+Space",
+        "Play the selection (or from the playhead) with the pre-roll before it and the post-roll after it (Preferences > Playback and Recording)."
+    ),
+    (
+        "file.relink",
+        "Relink Media...",
+        "",
+        "Find media the session cannot find (offline files) or point any session file at another file: search a folder only, or it and every folder inside it, by name (optionally any audio extension, any case), or locate each file by hand."
+    ),
+    (
         "file.close_all",
         "Close All",
         "",
@@ -956,6 +968,13 @@ impl App {
                 self.request_close_file(id);
             }
             "file.close_all" => self.close_with_prompt(CloseAfter::All),
+            "transport.play_preroll" => self.play_with_roll(),
+            "file.relink" => {
+                if self.session.is_none() {
+                    return Err("Open a session first.".into());
+                }
+                self.open_relink("");
+            }
             "file.close_unused" => {
                 if self.session.is_none() {
                     return Err("There is no multitrack session, so no file is in use.".into());

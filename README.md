@@ -25,7 +25,7 @@ documented command, MIT licensed. It was built clean-room from public knowledge 
   drag moves the clip straight up, a mostly-rightward one straight along its track);
   track and Master **automation lanes**: the chevron beside each Read selector opens a lane *under*
   the track (the track grows), with Show Envelopes (Volume, Pan), Select (which one is edited), and
-  protect / clear / previous / add / next keyframe tools; drag the lane's lower border to resize it;
+  protect / clear / previous / add / next keyframe tools; drag the lane's lower border to resize it; the wheel scrolls the tracks, and over the track headers or with Alt held it makes every track taller or shorter (scrolling is a view change and is never logged in the undo history);
   snapping (its magnet is in the Multitrack Tools corner, together with the other
   modifiers; the small arrow beside the magnet opens a regular drop-down menu of targets: clip
   starts and ends, markers, the ruler's time marks, the playhead and the session start; moved clips and trimmed or
@@ -43,7 +43,63 @@ documented command, MIT licensed. It was built clean-room from public knowledge 
   what falls behind and starting over where the playhead jumps. Each render carries on past
   the track's last clip until its effects have died away (a reverb or delay tail), up to the
   "longest effect tail" setting; a mixer view; session save/load (`.acsession`);
+  **library-based media links**: sessions (.acsession and .sesx) store every media file relative
+  to the session file (with `../` steps when it sits higher up), so moving or copying the whole
+  library folder (the deepest folder holding the session and all its media) anywhere keeps
+  every link; the old absolute path is only a fallback. Media that can't be found stays in the
+  session as an *Offline* file (silent, its clips kept, its link saved) and **Relink Media**
+  (File menu, or the link button in the Files panel) opens: search a folder only or it and every
+  folder inside it, ignore case, accept any audio extension, require the file to be long enough
+  for its clips, pick among several matches, or locate a file by hand;
   mixdown to a file or to a new file.
+- **Preferences that act:** Auto Save writes `name_backup_time.acsession` copies of a changed
+  session into a Backups folder beside it every few minutes, keeping the newest few (audio never
+  saved is left out of a backup); Data: triangular dither when WAV/AIFF/FLAC is written at 8, 16
+  or 24 bits, clipping 32-bit float files above 0 dBFS on open, and a short crossfade at delete
+  and cut seams in the Waveform editor; Effects: the default mix of a newly added effect and the
+  start-up plug-in scan; Memory: the session history limit; General: how the view follows
+  playback (page, centred, off) and opening the last session on start-up; Multitrack: new
+  tracks' lane height and Pre-render; Multitrack Clips: automatic crossfades on or off. Media & Disk
+  Cache keeps opened files' waveform peaks in a media cache in the temporary folder (oldest go
+  past the cache limit), and the temporary folder also holds exports in progress and speech
+  takes; Multitrack Clips: the default crossfade curve (equal power, linear, logarithmic),
+  smooth (never overshooting) curves through fade points, and "play overlapped portions" (off: a
+  clip under a later one is silent there, unless the two are crossfaded); Playback and
+  Recording: Play with Pre-roll and Post-roll (Ctrl+Shift+Space), punch-in recording on the
+  time selection, and Multitrack playback stopping after the last clip once the sound has died
+  away. Each Preferences page says at the top which of its settings are not connected yet
+  (now only the control-surface device and parallel effects).
+- **Bus tracks:** Multitrack > Track > Add Stereo Bus Track. A track's send (Sends header
+  view: on, level, pre/post fader) or its whole output (output menu > Bus) can feed a bus; busses
+  are mixed after the tracks that feed them, through their own effects and fader, into the
+  Master, and stay audible while a feeding track is soloed. Routes are kept by the bus's id, so
+  renaming a bus keeps them. Busses are kept in `.acsession` files (a `.sesx` save writes them
+  as plain tracks).
+- **Start-up:** AudioCraft no longer loads every VST3/CLAP plug-in when it opens: the list from
+  the last scan is shown and each plug-in loads when first used, so opening and closing stay
+  fast; the input device's channel count is asked on a background thread.
+- **Inputs and outputs:** each track records from any input of the interface, a stereo pair
+  ("Stereo In 3/4") or one input ("Mono In 5"), and each armed track gets a take of its own
+  input; monitoring uses the same input. Tracks play through the Master, or straight to an
+  output pair of their own (output menu > Hardware output > "Out 3/4"; live playback only,
+  mixdowns and exports keep every track), or "None". The Master plays on the outputs chosen in
+  Preferences > Audio Channel Mapping, which also shows how many channels the devices have.
+- **MCP (AI assistants):** Preferences > Control Surface > MCP lets assistants that speak the
+  Model Context Protocol work in AudioCraft. Off by default. The running app serves
+  `http://127.0.0.1:PORT/mcp` (this computer only, with a secret access token; requests from a web
+  page's origin are refused); assistants that start a program use `audiocraft --mcp-stdio`
+  ("Copy assistant setup" gives the settings). Tools: get_state, list_tracks, list_commands,
+  run_command, set_playhead, set_selection, set_track. Guardrails: four permission levels (Read
+  only, Navigate & play, Edit, Full), "Ask me before each change" (Allow / Deny in the app,
+  declined after a minute), a requests-per-minute limit, an activity log, every edit undoable;
+  quitting, anything that opens a dialog or another program, plug-in scans and choosing where
+  files are saved are never available. Protocol: MCP 2025-11-25 (also 2025-06-18, 2025-03-26 and
+  2024-11-05); `initialize` gives an `Mcp-Session-Id` that later requests send back with the
+  `MCP-Protocol-Version` header (unknown session: 404, unknown version: 400, DELETE ends a
+  session; batches only for 2025-03-26 and older). Tools carry titles and read-only /
+  destructive / idempotent hints; get_state, list_tracks and list_commands also return
+  `structuredContent` matching their `outputSchema`. The stdio bridge re-reads the preferences
+  for each message, so turning MCP on or changing the port needs no assistant restart.
 - **Keyframes:** every envelope's keyframes (clip volume and pan, track and Master lanes, fade
   points) are small squares that light up under the pointer, select on click (Shift/Ctrl adds) in
   the selection colour, drag (together when several are selected; Shift locks the move to the main

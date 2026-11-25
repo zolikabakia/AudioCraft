@@ -249,7 +249,70 @@ pub fn scan_hosted(rescan: bool) -> Vec<PluginEntry> {
             .cmp(b.format)
             .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
+    save_list(&v);
     v
+}
+
+/// The plug-in list from the last scan, kept beside the preferences: AudioCraft shows it at
+/// start-up without loading any plug-in (loading every plug-in made opening and closing the
+/// app slow); a plug-in itself loads only when it is used.
+fn list_path() -> Option<std::path::PathBuf> {
+    Some(crate::prefs::config_dir()?.join("plugin-list.json"))
+}
+
+fn save_list(v: &[PluginEntry]) {
+    if cfg!(test) {
+        return;
+    }
+    let Some(p) = list_path() else { return };
+    let rows: Vec<serde_json::Value> = v
+        .iter()
+        .map(|e| {
+            serde_json::json!({"id": e.id, "name": e.name, "vendor": e.vendor,
+                "format": e.format, "category": e.category})
+        })
+        .collect();
+    if let Some(d) = p.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let _ = crate::audio::write_atomic(&p, serde_json::Value::Array(rows).to_string().as_bytes());
+}
+
+/// The plug-in list saved by the last scan (no plug-in is loaded to read it).
+pub fn saved_list() -> Option<Vec<PluginEntry>> {
+    if hosting_disabled() {
+        return None;
+    }
+    let txt = std::fs::read_to_string(list_path()?).ok()?;
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&txt).ok()?;
+    let fixed = |s: &str, known: &[&'static str], fallback: &'static str| -> &'static str {
+        known.iter().find(|k| **k == s).copied().unwrap_or(fallback)
+    };
+    const FORMATS: &[&str] = &["CLAP", "VST3"];
+    const CATS: &[&str] = &[
+        "Filter and EQ",
+        "Amplitude and Compression",
+        "Time and Pitch",
+        "Reverb",
+        "Delay and Echo",
+        "Modulation",
+        "Special",
+        "Instrument",
+    ];
+    let v: Vec<PluginEntry> = rows
+        .iter()
+        .filter_map(|r| {
+            let id = r.get("id")?.as_str()?.to_string();
+            is_hosted(&id).then(|| PluginEntry {
+                name: r.get("name").and_then(|x| x.as_str()).unwrap_or(&id).to_string(),
+                vendor: r.get("vendor").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                format: fixed(r.get("format").and_then(|x| x.as_str()).unwrap_or(""), FORMATS, "VST3"),
+                category: fixed(r.get("category").and_then(|x| x.as_str()).unwrap_or(""), CATS, "Special"),
+                id,
+            })
+        })
+        .collect();
+    Some(v)
 }
 
 pub fn info(id: &str) -> Option<&'static PluginInfo> {

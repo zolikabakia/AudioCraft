@@ -362,7 +362,6 @@ impl SpecShape {
     }
 
     /// The opposite selection over the same time range.
-
     pub fn inverted(self, top: f32) -> SpecShape {
         match self {
             SpecShape::Inverse { inner, .. } => *inner,

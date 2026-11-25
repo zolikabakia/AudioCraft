@@ -34,6 +34,15 @@ pub struct Shared {
     preview_chain: Option<(Vec<EffectSlot>, Chain)>,
     pub out_rate: u32,
     pub out_channels: usize,
+    /// The device output channels the Master's Left and Right play on (Preferences > Audio
+    /// Channel Mapping; 0-based).
+    pub out_map: [usize; 2],
+    /// Tracks sent straight to hardware outputs, one buffer per device channel (this block).
+    pub direct_out: Vec<Vec<f32>>,
+    /// Stop once past this time and quiet for half a second (Preferences > Playback >
+    /// Stop playback at the end: the session's end, after effect tails die away).
+    pub stop_after: Option<f64>,
+    quiet: usize,
     /// A file-browser preview. It has its own source and position: prelisting a file must
     /// never move the editor's playhead or replace its mix. Written by the UI thread, read
     /// and advanced by the audio callback under `shared`.
@@ -51,7 +60,9 @@ pub struct Shared {
     pub in_channels: usize,
     /// Tracks whose input is heard through the output (the track's I button).
     pub monitors: Vec<Monitor>,
-    mon_ring: std::collections::VecDeque<[f32; 2]>,
+    /// Monitored input, every input channel of each frame in a row (`mon_stride` a frame).
+    mon_ring: std::collections::VecDeque<f32>,
+    mon_stride: usize,
     pub master_gain: f32,
     pub error: Option<String>,
     /// While stopped: where the playhead is being dragged to. The engine plays short stretches
@@ -88,6 +99,10 @@ impl Shared {
             preview_chain: None,
             out_rate: 48000,
             out_channels: 2,
+            out_map: [0, 1],
+            direct_out: vec![],
+            stop_after: None,
+            quiet: 0,
             files_preview: None,
             meter: [0.0; 2],
             track_meters: vec![],
@@ -98,14 +113,15 @@ impl Shared {
             in_peaks: vec![],
             in_channels: 0,
             monitors: vec![],
-            mon_ring: std::collections::VecDeque::with_capacity(8192),
+            mon_ring: std::collections::VecDeque::with_capacity(16384),
+            mon_stride: 2,
             master_gain: 1.0,
             error: None,
             scrub: None,
             scrub_fresh: true,
             scope: std::collections::VecDeque::with_capacity(2048),
             dsp_load: 0.0,
-            cache: ChainCache::default(),
+            cache: ChainCache::live(),
             scratch: vec![],
             tmp: vec![],
         }
@@ -147,7 +163,7 @@ impl Shared {
         self.playing = false;
         self.rack = Chain::default();
         self.rack_slots.clear();
-        self.cache = ChainCache::default();
+        self.cache = ChainCache::live();
         self.preview = None;
         self.preview_chain = None;
         self.source = Source::None;
@@ -159,7 +175,7 @@ impl Shared {
     pub fn reset_chains(&mut self) {
         self.rack = Chain::default();
         self.rack_slots.clear();
-        self.cache = ChainCache::default();
+        self.cache = ChainCache::live();
         self.preview_chain = None;
     }
 
@@ -247,6 +263,10 @@ impl Shared {
         let rate = self.out_rate as f32;
         self.scratch.resize(2, vec![]);
         for c in self.scratch.iter_mut() {
+            c.clear();
+            c.resize(n, 0.0);
+        }
+        for c in self.direct_out.iter_mut() {
             c.clear();
             c.resize(n, 0.0);
         }
@@ -437,6 +457,19 @@ impl Shared {
                     for c in 0..2 {
                         out[c][done..done + len].copy_from_slice(&part[c]);
                     }
+                    // tracks sent straight to hardware outputs
+                    let nd = self.cache.direct.len();
+                    if self.direct_out.len() < nd {
+                        self.direct_out.resize(nd, vec![0.0; n]);
+                    }
+                    for (c, d) in self.cache.direct.iter().enumerate() {
+                        if let Some(o) = self.direct_out.get_mut(c) {
+                            if o.len() < n {
+                                o.resize(n, 0.0);
+                            }
+                            o[done..done + len].copy_from_slice(&d[..len.min(d.len())]);
+                        }
+                    }
                     self.pos += len as f64 * dt;
                     done += len;
                 }
@@ -474,6 +507,28 @@ impl Shared {
         for c in 0..2 {
             let pk = self.scratch[c].iter().fold(0.0f32, |m, s| m.max(s.abs()));
             self.meter[c] = pk.max(self.meter[c] * 0.85);
+        }
+        // past the session's end: stop when the tails have died away (half a second quiet)
+        if let Some(end) = self.stop_after.filter(|_| self.playing && !self.looping) {
+            if self.pos > end {
+                let pk = self
+                    .scratch
+                    .iter()
+                    .chain(self.direct_out.iter())
+                    .flat_map(|c| c.iter())
+                    .fold(0.0f32, |m, s| m.max(s.abs()));
+                if pk < 1e-5 {
+                    self.quiet += n;
+                } else {
+                    self.quiet = 0;
+                }
+                if self.quiet as f64 >= 0.5 * self.out_rate.max(1) as f64 {
+                    self.playing = false;
+                    self.quiet = 0;
+                }
+            } else {
+                self.quiet = 0;
+            }
         }
         for i in 0..n.min(self.scratch[0].len()) {
             self.scope
@@ -524,16 +579,23 @@ impl Shared {
             self.mon_ring.clear();
             return;
         }
-        while self.mon_ring.len() > n * 3 + 256 {
-            self.mon_ring.pop_front();
+        let stride = self.mon_stride.clamp(1, 64);
+        while self.mon_ring.len() > (n * 3 + 256) * stride {
+            for _ in 0..stride {
+                self.mon_ring.pop_front();
+            }
         }
         for i in 0..n {
-            let Some(f) = self.mon_ring.pop_front() else {
+            if self.mon_ring.len() < stride {
                 break;
-            };
+            }
+            let mut f = [0.0f32; 64];
+            for v in f.iter_mut().take(stride) {
+                *v = self.mon_ring.pop_front().unwrap_or(0.0);
+            }
             let (mut l, mut r) = (0.0f32, 0.0f32);
             for m in &self.monitors {
-                let pick = |c: usize| if c == 0 { f[0] } else { f[1] };
+                let pick = |c: usize| f[c.min(stride - 1)];
                 let (a, b) = (pick(m.chans[0]), pick(m.chans[1]));
                 let pan = m.pan.clamp(-1.0, 1.0);
                 l += a * m.gain * (1.0 - pan.max(0.0));
@@ -559,6 +621,11 @@ pub struct Engine {
     pub in_choice: Option<String>,
     pub ctx: Option<egui::Context>,
     in_failed: bool,
+    /// Channels of the input device, learned once (0: not yet).
+    pub in_known: usize,
+    /// The background question to the input device about its channel count (see
+    /// `probe_input_channels`): its answer arrives here.
+    in_probe: Option<std::sync::mpsc::Receiver<usize>>,
 }
 
 fn dev_name(d: &cpal::Device) -> String {
@@ -590,6 +657,8 @@ impl Engine {
             in_choice: None,
             ctx: None,
             in_failed: false,
+            in_known: 0,
+            in_probe: None,
         }
     }
 
@@ -690,9 +759,30 @@ impl Engine {
                             s.dsp_load * 0.97 + load * 0.03
                         };
                     }
+                    // the Master plays on its mapped channels (Preferences > Audio Channel
+                    // Mapping), tracks sent to a hardware pair on theirs
+                    let pick = |m: usize, fallback: usize| if m < chans { m } else { fallback };
+                    let (ml, mr) = (pick(s.out_map[0], 0), pick(s.out_map[1], 1.min(chans - 1)));
                     for (i, fr) in data.chunks_mut(chans).enumerate() {
+                        let l = s.scratch[0].get(i).copied().unwrap_or(0.0);
+                        let r = s.scratch[1].get(i).copied().unwrap_or(0.0);
                         for (c, smp) in fr.iter_mut().enumerate() {
-                            let v = if c < 2 { s.scratch[c][i] } else { 0.0 };
+                            let mut v = s
+                                .direct_out
+                                .get(c)
+                                .and_then(|d| d.get(i))
+                                .copied()
+                                .unwrap_or(0.0);
+                            if chans == 1 {
+                                v += 0.5 * (l + r);
+                            } else {
+                                if c == ml {
+                                    v += l;
+                                }
+                                if c == mr {
+                                    v += r;
+                                }
+                            }
                             *smp = T::from_sample(v);
                         }
                     }
@@ -729,12 +819,64 @@ impl Engine {
         }
     }
 
+    /// How many input channels the chosen input device has (2 until it has been asked).
+    pub fn input_channel_count(&self) -> usize {
+        let open = self.lock().in_channels;
+        if open > 0 {
+            open
+        } else if self.in_known > 0 {
+            self.in_known
+        } else {
+            2
+        }
+    }
+
+    /// Ask the input device how many channels it has (once; again after another device is
+    /// chosen). Never in tests.
+    pub fn probe_input_channels(&mut self) {
+        if self.in_known > 0 || cfg!(test) {
+            return;
+        }
+        // asking the sound system can take a moment: it runs on its own thread, so the
+        // window never waits for it (the menus show 2 inputs until the answer comes)
+        if let Some(rx) = &self.in_probe {
+            if let Ok(n) = rx.try_recv() {
+                self.in_known = n.max(1);
+                self.in_probe = None;
+            }
+            return;
+        }
+        let choice = self.in_choice.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.in_probe = Some(rx);
+        let _ = std::thread::Builder::new()
+            .name("input-probe".into())
+            .spawn(move || {
+                let host = cpal::default_host();
+                let device = match &choice {
+                    Some(name) => host
+                        .input_devices()
+                        .ok()
+                        .and_then(|mut it| it.find(|d| &dev_name(d) == name))
+                        .or_else(|| host.default_input_device()),
+                    None => host.default_input_device(),
+                };
+                let n = device
+                    .and_then(|d| d.default_input_config().ok())
+                    .map(|c| c.channels().max(1) as usize)
+                    .unwrap_or(2);
+                let _ = tx.send(n);
+            });
+    }
+
     pub fn input_failed(&self) -> bool {
         self.in_failed
     }
 
     /// Another input device was chosen: reopen on the next frame that needs the input.
     pub fn restart_input(&mut self) {
+        self.in_known = 0;
+        self.in_probe = None;
         if !self.lock().recording {
             self.in_stream = None;
             self.lock().in_channels = 0;
@@ -778,6 +920,7 @@ impl Engine {
             s.in_channels = config.channels.max(1) as usize;
             s.in_peaks = vec![0.0; s.in_channels];
         }
+        self.in_known = config.channels.max(1) as usize;
         let stream = match fmt {
             cpal::SampleFormat::F32 => self.build_in::<f32>(&device, config)?,
             cpal::SampleFormat::I16 => self.build_in::<i16>(&device, config)?,
@@ -817,25 +960,23 @@ impl Engine {
                     let mut per = vec![0.0f32; chans];
                     let monitoring = !s.monitors.is_empty();
                     for fr in data.chunks(chans) {
-                        let mut two = [0.0f32; 2];
                         for (c, v) in fr.iter().enumerate() {
                             let f: f32 = <f32 as cpal::FromSample<T>>::from_sample_(*v);
                             pk[c.min(1)] = pk[c.min(1)].max(f.abs());
                             per[c] = per[c].max(f.abs());
-                            if c < 2 {
-                                two[c] = f;
-                            }
                             if s.recording {
                                 if let Some(ch) = s.rec.get_mut(c) {
                                     ch.push(f);
                                 }
                             }
                         }
-                        if chans == 1 {
-                            two[1] = two[0];
-                        }
                         if monitoring {
-                            s.mon_ring.push_back(two);
+                            // every input channel, so a track can monitor input 3, 4...
+                            s.mon_stride = chans.min(64);
+                            for v in fr.iter().take(64) {
+                                let f: f32 = <f32 as cpal::FromSample<T>>::from_sample_(*v);
+                                s.mon_ring.push_back(f);
+                            }
                         }
                     }
                     if chans == 1 {

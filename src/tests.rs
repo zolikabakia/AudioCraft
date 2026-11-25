@@ -1028,6 +1028,7 @@ fn master_automation_changes_within_one_block() {
         speed: 1.0,
         fin_curve: vec![],
         fout_curve: vec![],
+        hidden: vec![],
     };
     let mix = Mix {
         tracks: vec![MixTrack {
@@ -1045,6 +1046,10 @@ fn master_automation_changes_within_one_block() {
             polarity: 1.0,
             extra: Default::default(),
             pre: None,
+            direct: None,
+            bus: false,
+            to_bus: None,
+            send: None,
         }],
         master: 1.0,
         master_env: vec![(0.0, 0.0), (0.1, -60.0)],

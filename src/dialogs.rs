@@ -557,17 +557,9 @@ impl App {
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("Any colour:").color(theme::text_dim()));
-                        let mut c = Color32::from_rgb(color[0], color[1], color[2]);
-                        if egui::color_picker::color_edit_button_srgba(ui, &mut c, egui::color_picker::Alpha::Opaque).changed() {
-                            *color = [c.r(), c.g(), c.b()];
-                        }
-                        let mut hsv = egui::ecolor::Hsva::from(c);
-                        let mut hue = (hsv.h * 360.0).round();
-                        if ui.add(crate::theme::RSlider::new(&mut hue, 0.0..=360.0).text("Hue").suffix("\u{b0}")).changed() {
-                            hsv.h = hue / 360.0;
-                            let c2: Color32 = hsv.into();
-                            *color = [c2.r(), c2.g(), c2.b()];
-                        }
+                        // the swatch opens the picker: its square sets saturation (across) and
+                        // brightness (up), the strip under it the hue — no slider needed
+                        crate::theme::colour_button(ui, "track_color", color);
                     });
                     ok_cancel(ui, "OK", &mut ok, &mut close);
                 }

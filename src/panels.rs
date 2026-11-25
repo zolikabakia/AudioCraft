@@ -153,6 +153,19 @@ impl App {
                     self.request_close_file(id);
                 }
             }
+            // a closed file is no longer offline media
+            if !self.offline.is_empty() {
+                let open: std::collections::HashSet<u64> = self.files.iter().map(|f| f.id).collect();
+                self.offline.retain(|id, _| open.contains(id));
+            }
+            let tip = if self.offline.is_empty() {
+                "Relink Media...".to_string()
+            } else {
+                format!("Relink Media... ({} offline)", self.offline.len())
+            };
+            if icon_button(ui, Icon::Relink, !self.offline.is_empty(), &tip).clicked() {
+                self.pending_cmd = Some("cmd:file.relink");
+            }
         });
         // columns: drag a divider in the header to resize, double-click it to fit the names;
         // wider than the panel, the list scrolls sideways
@@ -232,7 +245,7 @@ impl App {
                 let vals = [
                     // unsaved changes show as " *" after the name; Status is for file states
                     if f.dirty() { format!("{} *", f.name) } else { f.name.clone() },
-                    String::new(),
+                    if self.offline.contains_key(&f.id) { "Offline".into() } else { String::new() },
                     audio::fmt_time(f.data.duration()),
                     format!("{} Hz", f.data.rate),
                     format!("{}", f.data.channels()),
@@ -946,7 +959,9 @@ impl App {
                                         changed |= ui
                                             .add(
                                                 egui::DragValue::new(&mut t.volume_db)
-                                                    .range(-60.0..=12.0)
+                                                    // the one track volume range: showing a
+                                                    // louder track never turns it down
+                                                    .range(crate::session::TRACK_DB_MIN..=crate::session::TRACK_DB_MAX)
                                                     .speed(0.1)
                                                     .suffix(" dB"),
                                             )

@@ -438,6 +438,7 @@ mod tests {
             vol_env: vec![],
             show_vol_env: false,
             auto: Default::default(),
+            bus: false,
         };
         let mut next = 50;
         let copy = duplicate_track(&track, "Track 1 copy".into(), 4, &mut next);

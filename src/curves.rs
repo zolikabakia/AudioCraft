@@ -464,6 +464,34 @@ pub fn fade_gain(pts: &[(f64, f32)], hs: &[Handles], x: f64, base: &dyn Fn(f64) 
     eval(&full, &fh, x.clamp(0.0, 1.0), 1.0, true).clamp(0.0, 1.0)
 }
 
+/// Smooth handles for point `i` that never make the curve overshoot or turn back between its
+/// neighbours (the slope is the harmonic mean of the two sides, flat at a peak or a dip), so a
+/// smoothed fade still only rises (or only falls) where its points do.
+fn monotone_handles(pts: &[(f64, f32)], i: usize) -> Handles {
+    let (Some(&(x0, y0)), Some(&(x1, y1)), Some(&(x2, y2))) =
+        (pts.get(i.wrapping_sub(1)), pts.get(i), pts.get(i + 1))
+    else {
+        return Handles::default();
+    };
+    let (w0, w1) = ((x1 - x0).max(1e-9), (x2 - x1).max(1e-9));
+    let (dp, dn) = ((y1 - y0) as f64 / w0, (y2 - y1) as f64 / w1);
+    let m = if dp * dn <= 0.0 {
+        0.0
+    } else {
+        2.0 * dp * dn / (dp + dn)
+    };
+    let (li, lo) = (w0 / 3.0, w1 / 3.0);
+    Handles {
+        on: true,
+        broken: false,
+        in_dt: -li,
+        in_dv: (-m * li) as f32,
+        out_dt: lo,
+        out_dv: (m * lo) as f32,
+        hold: false,
+    }
+}
+
 /// The fade points with their implied ends, and the handles to match.
 pub fn fade_full(pts: &[(f64, f32)], hs: &[Handles]) -> (Vec<(f64, f32)>, Vec<Handles>) {
     let mut full = Vec::with_capacity(pts.len() + 2);
@@ -480,6 +508,15 @@ pub fn fade_full(pts: &[(f64, f32)], hs: &[Handles]) -> (Vec<(f64, f32)>, Vec<Ha
         fh.extend(std::iter::repeat_n(Handles::default(), pts.len()));
     }
     fh.push(Handles::default());
+    // Preferences > Multitrack Clips > Smooth curves through fade points: a point without
+    // handles of its own gets smooth ones (the drawing and the sound both follow this)
+    if crate::prefs::smooth_fade_points() {
+        for i in 1..full.len().saturating_sub(1) {
+            if !fh[i].on {
+                fh[i] = monotone_handles(&full, i);
+            }
+        }
+    }
     (full, fh)
 }
 

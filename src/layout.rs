@@ -168,6 +168,8 @@ impl eframe::App for App {
             };
             let pos = egui::pos2(x, y);
             let hover = parts.get(2) == Some(&"h");
+            // `:d` presses without letting go (then `:h` points drag), for drag shots
+            let hold = parts.get(2) == Some(&"d");
             let button = |pressed| egui::Event::PointerButton {
                 pos,
                 button: egui::PointerButton::Primary,
@@ -179,7 +181,7 @@ impl eframe::App for App {
                 if !hover {
                     raw.events.push(button(true));
                 }
-            } else if now == f + 1 && !hover {
+            } else if now == f + 1 && !hover && !hold {
                 raw.events.push(button(false));
             } else if now > f && hover {
                 raw.events.push(egui::Event::PointerMoved(pos));
@@ -324,9 +326,15 @@ impl eframe::App for App {
         self.rack_windows(&ctx);
         self.track_eq_windows(&ctx);
         self.help_window(&ctx);
+        self.relink_window(&ctx);
+        // AI assistants over MCP (Preferences > Control Surface): requests and Allow / Deny
+        if self.screenshot.is_none() || cfg!(test) {
+            self.mcp_service(&ctx);
+        }
         // panels in windows of their own (New Window, Undock Panel, dual monitor)
         self.float_windows(&ctx);
         // pre-renders run a few milliseconds a frame (the gauge on the ruler fills as they go)
+        self.autosave_tick();
         if self.prerender_tick(std::time::Duration::from_millis(8)) {
             ctx.request_repaint();
         }
@@ -371,34 +379,6 @@ impl App {
         }
         let mut cmd: Vec<&'static str> = vec![];
         ctx.input_mut(|i| {
-            if i.events.iter().any(|e| {
-                matches!(
-                    e,
-                    egui::Event::Key {
-                        key: egui::Key::Delete,
-                        pressed: true,
-                        ..
-                    }
-                )
-            }) {
-                eprintln!(
-                    "DEBUG delete-key events: {:?}",
-                    i.events
-                        .iter()
-                        .filter_map(|e| match e {
-                            egui::Event::Key {
-                                key,
-                                pressed,
-                                modifiers,
-                                ..
-                            } => {
-                                Some((key, *pressed, modifiers))
-                            }
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                );
-            }
             let mut sc = |m: M, k: Key, c: &'static str| {
                 if i.consume_shortcut(&KS::new(m, k)) {
                     cmd.push(c);
@@ -447,6 +427,7 @@ impl App {
             sc(M::COMMAND, Key::S, "save");
             sc(M::COMMAND, Key::W, "close");
             sc(M::COMMAND, Key::Q, "quit");
+            sc(M::COMMAND | M::SHIFT, Key::Space, "cmd:transport.play_preroll");
             sc(M::SHIFT, Key::Space, "record");
             sc(M::SHIFT, Key::D, "spectral");
             sc(M::SHIFT, Key::E, "essential");
@@ -1061,6 +1042,7 @@ impl App {
                     "file.close_session_media",
                     &ctx,
                 );
+                self.menu_cmd(ui, has_session, "Relink Media...", "file.relink", &ctx);
                 ui.separator();
                 if ui
                     .add_enabled(
@@ -1490,6 +1472,7 @@ impl App {
                 ui.menu_button("Track", |ui| {
                     self.menu_cmd(ui, true, "Add Mono Audio Track", "track.add_mono", &ctx);
                     self.menu_cmd(ui, true, "Add Stereo Audio Track", "track.add_stereo", &ctx);
+                    self.menu_cmd(ui, true, "Add Stereo Bus Track", "track.add_bus", &ctx);
                     ui.separator();
                     self.menu_cmd(
                         ui,
@@ -1759,7 +1742,7 @@ impl App {
                 );
                 theme::check_toggle(ui, &mut self.auto_scroll, "Auto-scroll During Playback", "");
                 self.menu_cmd(ui, true, "Next Colour Theme", "view.theme_toggle", &ctx);
-                theme::check_toggle(ui, &mut self.show_tools_window, "Multitrack Tools", "");
+                theme::check_toggle(ui, &mut self.show_multitrack_tools, "Multitrack Tools", "");
                 theme::check_toggle(ui, &mut self.show_env, "Show Clip Volume Envelopes", "");
                 theme::check_toggle(ui, &mut self.show_pan_env, "Show Clip Pan Envelopes", "");
                 self.menu_cmd(
@@ -2001,10 +1984,8 @@ impl App {
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add_space(6.0);
+                // the app name, workspace tabs and Search Help fit the room the tools leave
                 self.workspace_bar_rtl(ui);
-                ui.add_space(12.0);
-                ui.label(RichText::new("AudioCraft").color(theme::accent()).strong());
             });
         });
     }

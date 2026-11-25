@@ -35,6 +35,29 @@ impl AudioData {
             self.frames() as f64 / self.rate as f64
         }
     }
+    /// The audio without frames `a..b`, the two sides joined with an equal-power crossfade of
+    /// `fade` frames (the last `fade` frames before the cut fade out while the first `fade`
+    /// frames after it fade in), so a delete never clicks. `fade` 0 is a plain cut.
+    pub fn without_smooth(&self, a: usize, b: usize, fade: usize) -> AudioData {
+        let (a, b) = self.span(a, b);
+        let n = fade.min(a).min(self.frames().saturating_sub(b));
+        if n == 0 {
+            return self.without(a, b);
+        }
+        let mut out = AudioData::new(self.rate, self.channels(), 0);
+        for (c, ch) in self.ch.iter().enumerate() {
+            let mut v = Vec::with_capacity(ch.len() - (b - a) - n);
+            v.extend_from_slice(&ch[..a - n]);
+            for i in 0..n {
+                let t = (i as f32 + 0.5) / n as f32;
+                v.push(ch[a - n + i] * (1.0 - t).sqrt() + ch[b + i] * t.sqrt());
+            }
+            v.extend_from_slice(&ch[b + n..]);
+            out.ch[c] = v;
+        }
+        out
+    }
+
     /// Copy a range of frames (clamped).
     pub fn slice(&self, a: usize, b: usize) -> AudioData {
         let n = self.frames();
@@ -260,6 +283,14 @@ fn load_wav(path: &Path) -> Result<LoadedFile, String> {
             for s in r.samples::<i32>() {
                 planar[c].push(s.map_err(|e| e.to_string())? as f32 * scale);
                 c = (c + 1) % chs;
+            }
+        }
+    }
+    // Preferences > Data: a 32-bit float file above 0 dBFS is clipped on open when asked
+    if spec.sample_format == hound::SampleFormat::Float && crate::prefs::clip_float_on_open() {
+        for p in planar.iter_mut() {
+            for v in p.iter_mut() {
+                *v = v.clamp(-1.0, 1.0);
             }
         }
     }
@@ -572,6 +603,45 @@ pub const SAVE_FILTERS: &[(&str, &[&str])] = &[
     ("AAC (*.m4a, bundled FFmpeg)", &["m4a"]),
 ];
 
+/// Triangular (TPDF) dither noise in least-significant bits, from a small fixed-seed
+/// generator, so a 16-bit or 24-bit file carries noise instead of distortion at low levels
+/// (Preferences > Data). Off when the depth is 0.
+struct Dither {
+    s: u32,
+    lsb: f32,
+}
+
+impl Dither {
+    fn new(lsb: f32) -> Self {
+        Dither {
+            s: 0x9E37_79B9,
+            lsb: if lsb.is_finite() { lsb.max(0.0) } else { 0.0 },
+        }
+    }
+
+    fn unit(&mut self) -> f32 {
+        self.s ^= self.s << 13;
+        self.s ^= self.s >> 17;
+        self.s ^= self.s << 5;
+        self.s as f32 / u32::MAX as f32
+    }
+
+    fn noise(&mut self) -> f32 {
+        if self.lsb <= 0.0 {
+            0.0
+        } else {
+            (self.unit() - self.unit()) * self.lsb
+        }
+    }
+}
+
+/// A sample as an integer of `maxv` full scale, dithered when asked.
+fn quantize(v: f32, maxv: f32, d: &mut Dither) -> i32 {
+    (v.clamp(-1.0, 1.0) * maxv + d.noise())
+        .round()
+        .clamp(-maxv - 1.0, maxv) as i32
+}
+
 fn wav_bytes(d: &AudioData, bits: u16, float: bool) -> Result<Vec<u8>, String> {
     let (bits, float) = match (bits, float) {
         (32, true) => (32, true),
@@ -603,9 +673,10 @@ fn wav_bytes(d: &AudioData, bits: u16, float: bool) -> Result<Vec<u8>, String> {
             }
         } else {
             let maxv = ((1i64 << (bits - 1)) - 1) as f32;
+            let mut dz = Dither::new(crate::prefs::dither_lsb());
             for i in 0..n {
                 for c in &d.ch {
-                    w.write_sample((c[i].clamp(-1.0, 1.0) * maxv).round() as i32)
+                    w.write_sample(quantize(c[i], maxv, &mut dz))
                         .map_err(|e| e.to_string())?;
                 }
             }
@@ -701,6 +772,7 @@ fn ext80(rate: f64) -> [u8; 10] {
 }
 
 fn aiff_bytes(d: &AudioData, bits: u16) -> Vec<u8> {
+    let mut dz = Dither::new(crate::prefs::dither_lsb());
     let bits = if bits == 24 {
         24u16
     } else if bits == 8 {
@@ -729,7 +801,7 @@ fn aiff_bytes(d: &AudioData, bits: u16) -> Vec<u8> {
     let maxv = ((1i64 << (bits - 1)) - 1) as f32;
     for i in 0..n {
         for c in &d.ch {
-            let s = (c[i].clamp(-1.0, 1.0) * maxv).round() as i32;
+            let s = quantize(c[i], maxv, &mut dz);
             let be = s.to_be_bytes();
             v.extend_from_slice(&be[4 - bps..]);
         }
@@ -738,6 +810,7 @@ fn aiff_bytes(d: &AudioData, bits: u16) -> Vec<u8> {
 }
 
 fn flac_bytes(d: &AudioData, bits: u16) -> Result<Vec<u8>, String> {
+    let mut dz = Dither::new(crate::prefs::dither_lsb());
     use flacenc::component::BitRepr;
     use flacenc::error::Verify;
     let bits = if bits == 24 { 24usize } else { 16 };
@@ -745,7 +818,7 @@ fn flac_bytes(d: &AudioData, bits: u16) -> Result<Vec<u8>, String> {
     let mut inter: Vec<i32> = Vec::with_capacity(d.frames() * d.channels());
     for i in 0..d.frames() {
         for c in &d.ch {
-            inter.push((c[i].clamp(-1.0, 1.0) * maxv).round() as i32);
+            inter.push(quantize(c[i], maxv, &mut dz));
         }
     }
     let config = flacenc::config::Encoder::default()
@@ -934,7 +1007,7 @@ pub fn save_with_meta(
         SaveFormat::Mp3 | SaveFormat::Aac => {
             let exe = ffmpeg().ok_or("MP3 and AAC export use FFmpeg, which was not found beside the app or on PATH. Reinstall AudioCraft with vendor/ffmpeg, or save as WAV, AIFF or FLAC.")?;
             let tmp =
-                std::env::temp_dir().join(format!("audiocraft-export-{}.wav", std::process::id()));
+                crate::prefs::temp_dir().join(format!("audiocraft-export-{}.wav", std::process::id()));
             std::fs::write(&tmp, wav_bytes(d, 24, false)?).map_err(|e| e.to_string())?;
             let out_tmp = path.with_extension(format!(
                 "partial.{}",

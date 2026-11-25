@@ -95,6 +95,8 @@ pub struct Extras {
     pub batch: Option<BatchRun>,
     pub batch_lines: Vec<String>,
     pub help_query: String,
+    /// How the toolbar's right end fitted last frame (tests).
+    pub toolbar_plan: Option<crate::dock::ToolbarPlan>,
     /// The command whose help is showing (Help window).
     pub help_topic: Option<&'static str>,
     pub download: Option<(String, Receiver<Result<PathBuf, String>>)>,
@@ -123,6 +125,7 @@ impl Default for Extras {
             batch: None,
             batch_lines: vec![],
             help_query: String::new(),
+            toolbar_plan: None,
             help_topic: None,
             download: None,
             download_status: String::new(),
@@ -136,12 +139,26 @@ impl Default for Extras {
 /// Which input channels a track's input name means (left, right).
 pub fn input_channels(name: &str) -> [usize; 2] {
     let n = name.to_ascii_lowercase();
+    let nums: Vec<usize> = n
+        .split(|c: char| !c.is_ascii_digit())
+        .filter_map(|x| x.parse().ok())
+        .filter(|v| *v >= 1)
+        .collect();
     if n.starts_with("mono") {
-        if n.contains("right") || n.ends_with(" 2") {
-            [1, 1]
-        } else {
-            [0, 0]
+        // "Mono In 3" (and the older "Mono: Left" / "Mono: Right")
+        if n.contains("right") {
+            return [1, 1];
         }
+        if n.contains("left") {
+            return [0, 0];
+        }
+        let c = nums.first().map(|v| v - 1).unwrap_or(0);
+        [c, c]
+    } else if n.starts_with("stereo in") {
+        // "Stereo In 3/4"
+        let a = nums.first().map(|v| v - 1).unwrap_or(0);
+        let b = nums.get(1).map(|v| v - 1).unwrap_or(a + 1);
+        [a, b]
     } else {
         [0, 1]
     }
@@ -250,6 +267,23 @@ impl App {
 
     /// Start capturing now at the playhead. Multitrack plays along; Waveform records in place.
     pub fn begin_recording(&mut self) -> bool {
+        // punch-in (Preferences > Playback and Recording): with a time selection, recording
+        // starts the pre-roll before it, keeps only the selection and stops after the post-roll
+        self.punch = None;
+        if self.mode == Mode::Multitrack && self.prefs.record_punch && !self.is_playing() {
+            if let Some((a, b)) = self
+                .session
+                .as_ref()
+                .and_then(|s| s.selection)
+                .filter(|(a, b)| b - a > 0.01)
+            {
+                self.punch = Some((a, b));
+                let pre = self.prefs.preroll_s.clamp(0.0, 60.0) as f64;
+                if let Some(s) = self.session.as_mut() {
+                    s.cursor = (a - pre).max(0.0);
+                }
+            }
+        }
         let at = self.cursor();
         let track = if self.mode == Mode::Multitrack {
             self.session
@@ -267,6 +301,10 @@ impl App {
                 self.status = format!("Recording from {}", self.engine.in_device_name);
                 if self.mode == Mode::Multitrack && !self.is_playing() {
                     self.play();
+                }
+                if let Some((_, b)) = self.punch {
+                    let post = self.prefs.postroll_s.clamp(0.0, 60.0) as f64;
+                    self.engine.lock().end = b + post;
                 }
                 true
             }
@@ -380,6 +418,8 @@ impl App {
         if self.screenshot.is_some() {
             return;
         }
+        // how many inputs the interface has (asked once), for the tracks' input menus
+        self.engine.probe_input_channels();
         let recording = self.is_recording();
         let mut monitors = Vec::new();
         let mut armed = false;
@@ -848,6 +888,9 @@ mod tests {
         assert_eq!(input_channels("Default Stereo Input"), [0, 1]);
         assert_eq!(input_channels("Mono: Left"), [0, 0]);
         assert_eq!(input_channels("Mono: Right"), [1, 1]);
+        assert_eq!(input_channels("Mono In 3"), [2, 2]);
+        assert_eq!(input_channels("Stereo In 3/4"), [2, 3]);
+        assert_eq!(input_channels("Stereo In 1/2"), [0, 1]);
         assert_eq!(input_channels("Stereo: USB Mic"), [0, 1]);
     }
 

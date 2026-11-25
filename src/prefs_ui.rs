@@ -40,6 +40,10 @@ const SEARCH: &[(&str, &str)] = &[
     ("Multitrack", "Handle size"),
     ("Multitrack", "Handle line width"),
     ("Multitrack", "Selected keyframe colour"),
+    ("Multitrack", "Snapping line colour"),
+    ("Control Surface", "MCP (AI assistants)"),
+    ("Control Surface", "Access token"),
+    ("Control Surface", "Ask me before each change"),
     ("Multitrack", "Keyframe grab distance"),
     ("Multitrack", "Default track height"),
     ("Multitrack", "Track Input/Output button height"),
@@ -67,6 +71,12 @@ const SEARCH: &[(&str, &str)] = &[
     ("Video", "Decoder folders"),
     ("Video", "Detect decoder"),
     ("Video", "Free decoder repositories"),
+];
+
+/// Settings shown on a page that nothing reads yet (kept so a later version can pick them up).
+const NOT_CONNECTED: &[(&str, &str)] = &[
+    ("Control Surface", "Device class (a control surface needs MIDI hardware support, which this version has not)"),
+    ("Effects", "parallel effects"),
 ];
 
 fn section(ui: &mut egui::Ui, title: &str) {
@@ -316,6 +326,11 @@ impl App {
             || p.brightness != self.prefs.brightness
             || p.saturation != self.prefs.saturation;
         theme::set_adjust(p.brightness, p.saturation);
+        theme::set_snap_override(p.snap_line_color);
+        self.engine.lock().out_map = [
+            p.map_left.max(1) as usize - 1,
+            p.map_right.max(1) as usize - 1,
+        ];
         if p.video_resolution != crate::video::preview_res() {
             crate::video::set_preview_res(p.video_resolution);
             // the playing picture and the paused frame are decoded again at the new size
@@ -341,7 +356,17 @@ impl App {
     }
 
     fn prefs_page(&mut self, ui: &mut egui::Ui, p: &mut Prefs, cat: usize) {
-        match CATEGORIES.get(cat).copied().unwrap_or("General") {
+        let name = CATEGORIES.get(cat).copied().unwrap_or("General");
+        // settings on this page that are saved but that nothing in this version reads yet
+        if let Some((_, list)) = NOT_CONNECTED.iter().find(|(c, _)| *c == name) {
+            ui.label(
+                RichText::new(format!("Not connected yet in this version: {list}."))
+                    .small()
+                    .color(theme::text_dim()),
+            );
+            ui.add_space(4.0);
+        }
+        match name {
             "General" => {
                 ui.checkbox(&mut p.show_tooltips, "Show tool tips");
                 slider(
@@ -468,22 +493,39 @@ impl App {
                 );
             }
             "Audio Channel Mapping" => {
+                let outs = self.engine.lock().out_channels.max(1);
+                let ins = self.engine.input_channel_count();
                 note(
                     ui,
-                    "Which output channel each of the session's channels plays on.",
+                    &format!(
+                        "Your output device has {outs} channel{}, your input device {ins}.",
+                        if outs == 1 { "" } else { "s" }
+                    ),
                 );
+                section(ui, "Master output");
+                note(ui, "The outputs the Master's Left and Right play on.");
+                let top = outs.clamp(2, 64) as u8;
                 for (lbl, v) in [
                     ("Left channel", &mut p.map_left),
                     ("Right channel", &mut p.map_right),
                 ] {
                     ui.horizontal(|ui| {
                         ui.add_sized(vec2(190.0, 18.0), egui::Label::new(lbl));
-                        ui.add(egui::DragValue::new(v).range(1..=32).prefix("Output "));
+                        ui.add(egui::DragValue::new(v).range(1..=top).prefix("Output "));
                     });
                 }
+                section(ui, "Tracks");
+                note(
+                    ui,
+                    "Each track records from the input in its input menu (a stereo pair or one mono input) and plays through the Master, or straight to an output pair of its own (its output menu > Hardware output: live playback only, mixdowns and exports keep every track).",
+                );
             }
             "Audio Hardware" => self.prefs_audio_hardware(ui, p),
             "Auto Save" => {
+                note(
+                    ui,
+                    "Backups go to a Backups folder beside the session (or into AudioCraft's own folder for a session never saved), as name_backup_time.acsession, whenever the session has changed. Audio never saved is left out of a backup.",
+                );
                 ui.checkbox(&mut p.autosave_on, "Automatically save backup copies every");
                 ui.add_enabled_ui(p.autosave_on, |ui| {
                     ui.horizontal(|ui| {
@@ -517,12 +559,14 @@ impl App {
                         });
                 });
                 note(ui, "No control surface is connected.");
+                self.mcp_prefs(ui, p);
             }
             "Data" => {
                 ui.checkbox(
                     &mut p.dither_on,
                     "Dither when converting to a lower bit depth",
                 );
+                note(ui, "Triangular dither added when WAV, AIFF or FLAC is written at 8, 16 or 24 bits.");
                 slider(
                     ui,
                     &mut p.dither_depth,
@@ -562,6 +606,10 @@ impl App {
                     " %",
                 );
                 ui.checkbox(&mut p.plugin_scan_start, "Scan for plug-ins on start-up");
+                note(
+                    ui,
+                    "Shows the plug-ins found by the last scan as soon as AudioCraft opens, without loading them (that kept opening and closing fast); a plug-in loads when it is first used. Rescan in the effects menus looks for new ones.",
+                );
                 ui.checkbox(
                     &mut p.dock_plugin_editors,
                     "Open VST3 and CLAP plug-in windows in the Plug-ins panel",
@@ -576,6 +624,10 @@ impl App {
             }
             "Media & Disk Cache" => {
                 ui.checkbox(&mut p.save_peak_files, "Save peak files");
+                note(
+                    ui,
+                    "Waveform peaks of opened files are kept in a media cache in the temporary folder, so a file opens faster the next time; the oldest go first when the cache passes its limit. The temporary folder also holds exports in progress and speech takes.",
+                );
                 ui.horizontal(|ui| {
                     ui.add_sized(vec2(190.0, 18.0), egui::Label::new("Temporary folder"));
                     ui.add(
@@ -665,7 +717,7 @@ impl App {
                         egui::Label::new("Selected keyframe colour"),
                     );
                     let mut c = p.keyframe_selected_color;
-                    if ui.color_edit_button_srgb(&mut c).changed() {
+                    if theme::colour_button(ui, "keyframe_selected_colour", &mut c) {
                         p.keyframe_selected_color = c;
                     }
                 });
@@ -761,6 +813,26 @@ impl App {
                     ui,
                     "How far apart two clips have to be before a drag with Snapping on snaps them together.",
                 );
+                // the snapping line's colour: the theme's contrast colour until picked
+                ui.horizontal(|ui| {
+                    ui.add_sized(vec2(190.0, 18.0), egui::Label::new("Snapping line colour"));
+                    let t = theme::theme_snap_line();
+                    let mut c = p.snap_line_color.unwrap_or([t.r(), t.g(), t.b()]);
+                    if theme::colour_button(ui, "snap_line_colour", &mut c) {
+                        p.snap_line_color = Some(c);
+                    }
+                    if p.snap_line_color.is_some() {
+                        if ui
+                            .small_button("Theme colour")
+                            .on_hover_text("Go back to the theme's contrast colour")
+                            .clicked()
+                        {
+                            p.snap_line_color = None;
+                        }
+                    } else {
+                        ui.label(egui::RichText::new("theme").small().color(theme::text_dim()));
+                    }
+                });
                 section(ui, "Snapping targets");
                 ui.checkbox(
                     &mut p.snap_time_display,
@@ -881,7 +953,14 @@ impl App {
                     &mut p.record_punch,
                     "Punch in on the time selection when recording",
                 );
-                ui.checkbox(&mut p.stop_at_end, "Stop playback at the end of the file");
+                ui.checkbox(
+                    &mut p.stop_at_end,
+                    "Stop playback at the end (Multitrack: after the last clip, once effect tails have died away)",
+                );
+                note(
+                    ui,
+                    "Pre-roll and post-roll: Play with Pre-roll and Post-roll (Ctrl+Shift+Space, or from the Command Palette), and around a punch-in. Punch in: with a time selection, Record starts the pre-roll before it, keeps only the selection, and stops after the post-roll.",
+                );
                 section(ui, "Recordings Folder");
                 ui.horizontal(|ui| {
                     let shown = p.recordings_dir().display().to_string();
@@ -1277,5 +1356,103 @@ impl App {
             .checkbox(&mut self.auto_scroll, "Auto-scroll during playback")
             .changed()
         {}
+    }
+}
+
+impl App {
+    /// Preferences > Control Surface > MCP: let AI assistants connect, with the guardrails.
+    fn mcp_prefs(&mut self, ui: &mut egui::Ui, p: &mut Prefs) {
+        section(ui, "MCP (AI assistants)");
+        note(
+            ui,
+            "AI assistants that speak the Model Context Protocol can look at your session and, if you allow it, play, navigate and edit. Only programs on this computer that know the access token can connect.",
+        );
+        if ui
+            .checkbox(&mut p.mcp_enabled, "Allow AI assistants to connect (MCP server)")
+            .changed()
+            && p.mcp_enabled
+            && p.mcp_token.len() < 16
+        {
+            p.mcp_token = crate::mcp::new_token();
+        }
+        ui.add_enabled_ui(p.mcp_enabled, |ui| {
+            ui.horizontal(|ui| {
+                ui.add_sized(vec2(190.0, 18.0), egui::Label::new("Port (this computer only)"));
+                ui.add(egui::DragValue::new(&mut p.mcp_port).range(1024..=65535));
+            });
+            ui.horizontal(|ui| {
+                ui.add_sized(vec2(190.0, 18.0), egui::Label::new("Access token"));
+                let shown = if p.mcp_token.len() > 8 {
+                    format!("{}\u{2026}", &p.mcp_token[..8])
+                } else {
+                    "(none yet)".to_string()
+                };
+                ui.label(egui::RichText::new(shown).monospace().color(theme::text_dim()));
+                if ui.small_button("Copy").on_hover_text("Copy the whole token").clicked() {
+                    ui.ctx().copy_text(p.mcp_token.clone());
+                }
+                if ui
+                    .small_button("New token")
+                    .on_hover_text("Make a new token: assistants using the old one are locked out")
+                    .clicked()
+                {
+                    p.mcp_token = crate::mcp::new_token();
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.add_sized(vec2(190.0, 18.0), egui::Label::new("Assistants may"));
+                let cur = p.mcp_level.min(3) as usize;
+                egui::ComboBox::from_id_salt("pf_mcp_level")
+                    .selected_text(crate::mcp::LEVELS[cur].0)
+                    .show_ui(ui, |ui| {
+                        for (i, (name, tip)) in crate::mcp::LEVELS.iter().enumerate() {
+                            ui.selectable_value(&mut p.mcp_level, i as u8, *name)
+                                .on_hover_text(*tip);
+                        }
+                    });
+            });
+            note(ui, crate::mcp::LEVELS[p.mcp_level.min(3) as usize].1);
+            ui.checkbox(&mut p.mcp_confirm, "Ask me before each change");
+            let mut rate = p.mcp_rate_per_min as f32;
+            slider(ui, &mut rate, defaults().mcp_rate_per_min as f32, 5.0..=600.0, "Most requests a minute", "");
+            p.mcp_rate_per_min = rate.round().max(1.0) as u32;
+            note(
+                ui,
+                "Never available to assistants: quitting, anything that opens a dialog or another program, plug-in scans, choosing where files are saved. Every edit can be undone with Ctrl+Z.",
+            );
+            ui.horizontal(|ui| {
+                ui.add_sized(vec2(190.0, 18.0), egui::Label::new("Status"));
+                let st = if self.mcp.status.is_empty() { "Off" } else { self.mcp.status.as_str() };
+                ui.label(egui::RichText::new(st).color(theme::text_dim()));
+            });
+            ui.horizontal(|ui| {
+                if ui
+                    .button("Copy assistant setup")
+                    .on_hover_text("Settings for an assistant that starts a program (e.g. a desktop chat app): it runs AudioCraft's --mcp-stdio bridge")
+                    .clicked()
+                {
+                    ui.ctx().copy_text(self.mcp_client_config());
+                }
+                if ui
+                    .button("Copy address")
+                    .on_hover_text("For assistants that connect over HTTP: send the token as \"Authorization: Bearer <token>\"")
+                    .clicked()
+                {
+                    ui.ctx().copy_text(format!("http://127.0.0.1:{}/mcp", p.mcp_port));
+                }
+            });
+            if !self.mcp.log.is_empty() {
+                ui.label(egui::RichText::new("Recent activity").small().color(theme::text_dim()));
+                egui::ScrollArea::vertical()
+                    .id_salt("mcp_log")
+                    .max_height(110.0)
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for l in self.mcp.log.iter().rev().take(40).collect::<Vec<_>>().into_iter().rev() {
+                            ui.label(egui::RichText::new(l).small().monospace());
+                        }
+                    });
+            }
+        });
     }
 }

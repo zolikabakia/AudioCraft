@@ -103,6 +103,7 @@ Every feature is a command with a stable ID. Run commands from the menus, from t
 | `clip.crossfade` | Crossfade with Next Clip |  | Turn the overlap with the next clip into a balanced crossfade. |
 | `clip.mixdown_new` | Mixdown Session to New File |  | Render the session into a new file. |
 | `track.add_stereo` | Add Stereo Track |  | Add a stereo track to the session. |
+| `track.add_bus` | Add Stereo Bus Track |  | Add a bus track: other tracks' sends and outputs can feed it (their Sends view and output menu), and it goes on to the Master with its own effects and fader. |
 | `track.add_mono` | Add Mono Track |  | Add a mono track to the session. |
 | `track.duplicate` | Duplicate Track | Ctrl+Shift+D | Copy the selected track and all its clips. |
 | `track.delete` | Delete Track |  | Remove the selected track and its clips. |
@@ -207,6 +208,8 @@ Every feature is a command with a stable ID. Run commands from the menus, from t
 | `file.open_selected` | Open in Waveform Editor |  | Open the file selected in the Files list in the Waveform editor. |
 | `file.insert_selected` | Insert into Multitrack |  | Put the file selected in the Files list on a track at the playhead, creating a session when one is not open. |
 | `file.close_selected` | Close Selected File |  | Close the file selected in the Files list, asking first if it has unsaved changes. |
+| `transport.play_preroll` | Play with Pre-roll and Post-roll | Ctrl+Shift+Space | Play the selection (or from the playhead) with the pre-roll before it and the post-roll after it (Preferences > Playback and Recording). |
+| `file.relink` | Relink Media... |  | Find media the session cannot find (offline files) or point any session file at another file: search a folder only, or it and every folder inside it, by name (optionally any audio extension, any case), or locate each file by hand. |
 | `file.close_all` | Close All |  | Close every file and the session; anything unsaved is asked about first (Yes, Yes To All, No, No To All, Cancel). |
 | `file.close_unused` | Close Unused Media |  | Close the files that no clip of the session uses. |
 | `file.close_session_media` | Close Session and Its Media |  | Close the session and the files its clips use; unsaved changes are asked about first. |
@@ -278,4 +281,3 @@ Every feature is a command with a stable ID. Run commands from the menus, from t
 | `tracks.hide_empty` | Hide Empty Tracks |  | Hide tracks that hold no clips. |
 | `clip.fade_in_remove` | Remove Fade In |  | Take the fade-in off the selected clips. |
 | `clip.fade_out_remove` | Remove Fade Out |  | Take the fade-out off the selected clips. |
-

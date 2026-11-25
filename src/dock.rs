@@ -1570,16 +1570,14 @@ impl App {
     }
 
     /// The workspace tabs at the right of the toolbar, with the workspace menu and the overflow.
-    pub fn workspace_bar(&mut self, ui: &mut egui::Ui) {
+    /// The workspace tabs in `shown` (the current one with its ≡ menu), then » listing every
+    /// workspace not shown.
+    pub fn workspace_bar(&mut self, ui: &mut egui::Ui, shown: &[String]) {
         let names = self.ws.names();
         let current = self.ws.current.clone();
-        let mut shown: Vec<String> = names.iter().take(3).cloned().collect();
-        if !shown.contains(&current) {
-            shown.push(current.clone());
-        }
         let mut pick: Option<String> = None;
         let mut action: Option<&'static str> = None;
-        for n in &shown {
+        for n in shown {
             let on = *n == current;
             let resp = ui.add(
                 egui::Button::new(RichText::new(n).color(if on {
@@ -1623,7 +1621,7 @@ impl App {
             egui::Button::new(RichText::new("\u{00bb}").color(theme::text())).frame(false),
         )
         .ui(ui, |ui| {
-            for n in names.iter().skip(3) {
+            for n in names.iter().filter(|n| !shown.contains(n)) {
                 if ui.selectable_label(*n == current, n).clicked() {
                     pick = Some(n.clone());
                     ui.close();
@@ -1654,14 +1652,134 @@ impl App {
         }
     }
 
-    /// Right end of the toolbar (laid out right to left): Search Help, then the workspace tabs.
+    /// What the right end of the toolbar shows in `avail` points: the app name, the workspace
+    /// tabs and the Search Help box (or just its magnifier). A narrow window gives things up in
+    /// this order so nothing ever runs over the tools: the app name, the other workspace tabs
+    /// (they stay in the » menu), the search box's width, the search box itself (a magnifier
+    /// remains), and finally the current workspace's tab.
+    pub fn toolbar_right_plan(
+        avail: f32,
+        tab_w: &dyn Fn(&str, bool) -> f32,
+        label_w: f32,
+        more_w: f32,
+        names: &[String],
+        current: &str,
+    ) -> ToolbarPlan {
+        let mut shown: Vec<String> = names.iter().take(3).cloned().collect();
+        if !shown.iter().any(|n| n == current) {
+            shown.push(current.to_string());
+        }
+        let mut plan = ToolbarPlan {
+            label: true,
+            shown,
+            search_w: 200.0,
+            search_icon: false,
+            fits: true,
+        };
+        let total = |p: &ToolbarPlan| {
+            6.0 + if p.search_icon { 26.0 } else { p.search_w }
+                + 6.0
+                + p.shown.iter().map(|n| tab_w(n, n == current)).sum::<f32>()
+                + more_w
+                + if p.label { label_w } else { 0.0 }
+        };
+        for _ in 0..32 {
+            let t = total(&plan);
+            if t <= avail {
+                break;
+            }
+            if plan.label {
+                plan.label = false;
+            } else if let Some(i) = plan.shown.iter().rposition(|n| n != current) {
+                plan.shown.remove(i);
+            } else if !plan.search_icon && plan.search_w > 110.0 {
+                plan.search_w = (plan.search_w - (t - avail)).max(110.0);
+            } else if !plan.search_icon {
+                plan.search_icon = true;
+            } else if !plan.shown.is_empty() {
+                plan.shown.clear();
+            } else {
+                break;
+            }
+        }
+        plan
+    }
+
+    /// Right end of the toolbar (laid out right to left): Search Help, the workspace tabs and
+    /// the app name, fitted into the space the tools leave (see [`App::toolbar_right_plan`]).
     pub fn workspace_bar_rtl(&mut self, ui: &mut egui::Ui) {
+        let avail = ui.available_width();
+        let font = egui::TextStyle::Button.resolve(ui.style());
+        let pad = 2.0 * ui.spacing().button_padding.x;
+        let isx = ui.spacing().item_spacing.x;
+        let painter = ui.painter().clone();
+        let text_w =
+            |s: &str| painter.layout_no_wrap(s.to_string(), font.clone(), Color32::WHITE).size().x;
+        let menu_w = text_w("\u{2261}") + pad + isx;
+        let tab_w = |n: &str, on: bool| {
+            text_w(n) + pad + 14.0 + isx + if on { menu_w } else { 0.0 }
+        };
+        let label_w = text_w("AudioCraft") * 1.08 + 12.0 + isx;
+        let more_w = text_w("\u{00bb}") + pad + isx;
+        let names = self.ws.names();
+        let current = self.ws.current.clone();
+        let plan = Self::toolbar_right_plan(avail, &tab_w, label_w, more_w, &names, &current);
+        self.extra.toolbar_plan = Some(plan.clone());
+        let tabs_w_full =
+            plan.shown.iter().map(|n| tab_w(n, *n == current)).sum::<f32>() + more_w;
+        ui.add_space(6.0);
+        if plan.search_icon {
+            // too narrow for the box: the magnifier opens Help, where searching goes on
+            if crate::theme::icon_button(ui, crate::theme::Icon::ZoomIn, false, "Search Help")
+                .clicked()
+            {
+                self.help_topic_open(None);
+            }
+        } else {
+            self.search_help_box(ui, plan.search_w);
+        }
+        ui.add_space(6.0);
+        // the tabs sit right against the search box, like the original: their area is as wide
+        // as they were drawn last frame (the estimate above only decides what fits)
+        let wid = ui.make_persistent_id(("ws_tabs_width", plan.shown.clone()));
+        let measured: Option<f32> = ui.data(|d| d.get_temp(wid));
+        let tabs_w = measured
+            .unwrap_or(tabs_w_full)
+            .min(tabs_w_full)
+            .min(ui.available_width().max(0.0));
+        let used = ui.allocate_ui_with_layout(
+            vec2(tabs_w, ui.available_height()),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.set_clip_rect(ui.max_rect().intersect(ui.clip_rect()));
+                self.workspace_bar(ui, &plan.shown);
+                ui.min_rect().width()
+            },
+        );
+        let real = used.inner.ceil();
+        if measured.is_none_or(|m| (m - real).abs() > 0.5) && real > 0.0 {
+            ui.data_mut(|d| d.insert_temp(wid, real));
+            ui.ctx().request_repaint();
+        }
+        if plan.label {
+            ui.add_space(12.0);
+            ui.label(RichText::new("AudioCraft").color(theme::accent()).strong());
+        }
+        // did everything stay inside the room the tools left? (tests)
+        let (used, room) = (ui.min_rect(), ui.max_rect());
+        if let Some(p) = self.extra.toolbar_plan.as_mut() {
+            p.fits = used.left() >= room.left() - 0.5;
+        }
+    }
+
+    /// The Search Help box, `w` points wide, with its results under it while typing.
+    fn search_help_box(&mut self, ui: &mut egui::Ui, w: f32) {
         let mut q = std::mem::take(&mut self.extra.help_query);
         // the magnifier is drawn by hand, centred on the box's middle (a text glyph sits high)
         let r = ui.add(
             egui::TextEdit::singleline(&mut q)
                 .hint_text("Search Help")
-                .desired_width(200.0)
+                .desired_width(w)
                 .vertical_align(egui::Align::Center)
                 .margin(egui::Margin {
                     left: 22,
@@ -1698,47 +1816,6 @@ impl App {
         } else {
             let ctx = ui.ctx().clone();
             self.help_results_popup(&ctx, r.rect, r.has_focus());
-        }
-        ui.add_space(6.0);
-        // the tabs sit right against the search box, like the original: their width is
-        // measured from what was drawn last frame (estimated on the very first one)
-        let wid = ui.make_persistent_id("ws_tabs_width");
-        let measured: Option<f32> = ui.data(|d| d.get_temp(wid));
-        let w = match measured {
-            Some(m) => m,
-            None => {
-                let mut shown: Vec<String> = self.ws.names().into_iter().take(3).collect();
-                if !shown.contains(&self.ws.current) {
-                    shown.push(self.ws.current.clone());
-                }
-                let font = egui::TextStyle::Button.resolve(ui.style());
-                shown
-                    .iter()
-                    .map(|n| {
-                        ui.painter()
-                            .layout_no_wrap(n.clone(), font.clone(), Color32::WHITE)
-                            .size()
-                            .x
-                            + 14.0
-                            + 2.0 * ui.spacing().button_padding.x
-                    })
-                    .sum::<f32>()
-                    + 28.0
-            }
-        }
-        .min(ui.available_width());
-        let used = ui.allocate_ui_with_layout(
-            vec2(w, ui.available_height()),
-            egui::Layout::left_to_right(egui::Align::Center),
-            |ui| {
-                self.workspace_bar(ui);
-                ui.min_rect().width()
-            },
-        );
-        let real = used.inner.ceil();
-        if measured.map(|m| (m - real).abs() > 0.5).unwrap_or(true) {
-            ui.data_mut(|d| d.insert_temp(wid, real));
-            ui.ctx().request_repaint();
         }
     }
 
@@ -2204,4 +2281,19 @@ mod tests {
         let (l, r, p) = measure(&d);
         assert!(l < r && p > -0.1);
     }
+}
+
+/// The right end of the toolbar as it fits the window (see `App::toolbar_right_plan`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolbarPlan {
+    /// The app name is shown.
+    pub label: bool,
+    /// Workspace tabs shown (the rest are in the » menu).
+    pub shown: Vec<String>,
+    /// The Search Help box's width.
+    pub search_w: f32,
+    /// Only the magnifier is shown (no room for the box).
+    pub search_icon: bool,
+    /// Everything stayed inside the room the tools left (measured after drawing).
+    pub fits: bool,
 }

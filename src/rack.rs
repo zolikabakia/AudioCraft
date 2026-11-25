@@ -400,9 +400,12 @@ impl App {
             return;
         };
         let name = e.name().to_string();
+        // Preferences > Effects > Default mix of new effects
+        let mut new_slot = EffectSlot::new(e);
+        new_slot.mix = crate::prefs::fx_default_mix();
         let idx = match slot {
             Some(i) if i < slots.len() => {
-                slots[i] = EffectSlot::new(e);
+                slots[i] = new_slot;
                 i
             }
             _ => {
@@ -413,7 +416,7 @@ impl App {
                     );
                     return;
                 }
-                slots.push(EffectSlot::new(e));
+                slots.push(new_slot);
                 slots.len() - 1
             }
         };

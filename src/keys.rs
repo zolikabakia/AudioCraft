@@ -226,6 +226,34 @@ pub fn v_at(kind: VKind, area: Rect, y: f32) -> f32 {
 }
 
 /// A keyframe's value in words.
+/// How far a value moved, in its own unit (the drag readout's change).
+pub fn delta_text(kind: VKind, d: f32) -> String {
+    match kind {
+        VKind::Vol => format!("{d:+.1} dB"),
+        VKind::Pan => {
+            let p = (d * 100.0).round();
+            if p.abs() < 0.5 {
+                "0".into()
+            } else if p < 0 as f32 {
+                format!("{:.0} to L", -p)
+            } else {
+                format!("{p:.0} to R")
+            }
+        }
+        VKind::Fade => format!("{:+.0} %", d * 100.0),
+        VKind::Lin { binary: true, .. } => String::new(),
+        VKind::Lin { min, max, .. } => {
+            if (max - min) > 50.0 {
+                format!("{d:+.0}")
+            } else if (max - min) > 5.0 {
+                format!("{d:+.1}")
+            } else {
+                format!("{d:+.2}")
+            }
+        }
+    }
+}
+
 pub fn value_text(kind: VKind, v: f32) -> String {
     match kind {
         VKind::Vol => format!("{v:+.1} dB"),
@@ -484,6 +512,7 @@ impl App {
         let mut handle_draw: Vec<(Pos2, Pos2, Color32, bool, Rect)> = vec![];
         let mut any_key_hovered = false;
         self.multi_drag.key_spots.clear();
+        self.multi_drag.handle_spots.clear();
         for v in views {
             let Some((env, hs)) = self
                 .session
@@ -511,6 +540,9 @@ impl App {
                             Side::Out => (h.out_dt, h.out_dv),
                         };
                         let hp = v.pos(t + dt, val + dv);
+                        self.multi_drag
+                            .handle_spots
+                            .push((v.target, i, side == Side::In, hp));
                         let hr = Rect::from_center_size(hp, vec2(hit * 1.6, hit * 1.6));
                         let id = ui.scope_id().with(("keyh", v.target, i, side == Side::In));
                         let r = if v.editable {
@@ -548,6 +580,10 @@ impl App {
                             ) = (r.interact_pointer_pos(), self.multi_drag.key_drag.clone())
                             {
                                 if target == v.target && idx == i {
+                                    // Ctrl held: the handle follows at a fifth of the speed
+                                    let ctrl = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
+                                    let real_pp = pp;
+                                    let pp = self.fine_pos(pp, ctrl);
                                     // Shift keeps the handle on one of the main 8 directions
                                     // through its own keyframe (45° steps, like a drawing app)
                                     let pp = if ui.input(|i| i.modifiers.shift) {
@@ -556,6 +592,7 @@ impl App {
                                         pp
                                     };
                                     self.move_handle(v, idx, side, alone, pp);
+                                    self.handle_readout(v, idx, side == Side::In, real_pp);
                                 }
                             }
                         }
@@ -690,6 +727,10 @@ impl App {
                 }
                 if r.dragged() {
                     if let Some(pp0) = r.interact_pointer_pos() {
+                        // Ctrl held: the keyframes follow at a fifth of the mouse's speed
+                        let ctrl = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
+                        let real_pp = pp0;
+                        let pp0 = self.fine_pos(pp0, ctrl);
                         match self.multi_drag.key_drag.clone() {
                             Some(KeyDrag::Keys {
                                 target,
@@ -706,6 +747,31 @@ impl App {
                                     pp0
                                 };
                                 self.move_keys(v, &start, grab, origin, pp);
+                                // the floating readout: where the grabbed keyframe is now and
+                                // how far it moved (value and time)
+                                let rate = self.rate();
+                                let fmt = self.time_format;
+                                let now = self
+                                    .session
+                                    .as_ref()
+                                    .and_then(|s| env_of(s, v.target))
+                                    .and_then(|(e, _)| e.get(grab).copied());
+                                let was = start.iter().find(|x| x.0 == grab).map(|x| (x.1, x.2));
+                                if let (Some((t1, v1)), Some((t0, v0))) = (now, was) {
+                                    let d = delta_text(v.kind, v1 - v0);
+                                    let value = value_text(v.kind, v1 + v.voff);
+                                    let head = if d.is_empty() {
+                                        value
+                                    } else {
+                                        format!("{value}   ({d})")
+                                    };
+                                    let at = v.origin + t1 * v.scale;
+                                    let dt = (t1 - t0) * v.scale;
+                                    self.multi_drag.readout = Some((
+                                        real_pp,
+                                        format!("{head}\n{}   ({dt:+.3} s)", fmt.format(at.max(0.0), rate)),
+                                    ));
+                                }
                             }
                             Some(KeyDrag::Pull { target, idx })
                                 if target == v.target && idx == i =>
@@ -717,6 +783,7 @@ impl App {
                                     pp0
                                 };
                                 self.pull_handles(v, idx, pp);
+                                self.handle_readout(v, idx, false, real_pp);
                             }
                             _ => {}
                         }
@@ -886,6 +953,36 @@ impl App {
 
     /// Alt+drag on a keyframe: fresh smooth handles, the out handle at the pointer and the in
     /// handle mirrored through the keyframe.
+    /// The floating readout while a curve handle is dragged: the keyframe's value and how much
+    /// the handle rises over how long.
+    fn handle_readout(&mut self, v: &KeyView, idx: usize, inside: bool, pp: Pos2) {
+        let Some(s) = self.session.as_ref() else {
+            return;
+        };
+        let Some((e, hs)) = env_of(s, v.target) else {
+            return;
+        };
+        let Some(&(_, val)) = e.get(idx) else {
+            return;
+        };
+        let h = curves::h_at(hs, e.len(), idx);
+        let (dt, dv) = if inside {
+            (h.in_dt, h.in_dv)
+        } else {
+            (h.out_dt, h.out_dv)
+        };
+        let rise = delta_text(v.kind, dv);
+        self.multi_drag.readout = Some((
+            pp,
+            format!(
+                "{}\nhandle {}   over {:.3} s",
+                value_text(v.kind, val + v.voff),
+                if rise.is_empty() { "-".into() } else { rise },
+                (dt * v.scale).abs()
+            ),
+        ));
+    }
+
     fn pull_handles(&mut self, v: &KeyView, idx: usize, pp: Pos2) {
         let Some(s) = self.session.as_mut() else {
             return;
@@ -1047,7 +1144,6 @@ impl App {
     }
 
     /// Delete the selected keyframes (Delete / Backspace in the Multitrack Editor).
-
     pub fn delete_selected_keys(&mut self) -> bool {
         let sel = std::mem::take(&mut self.multi_drag.key_sel);
         let Some(t) = sel.target else { return false };

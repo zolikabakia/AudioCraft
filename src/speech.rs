@@ -22,7 +22,7 @@ fn temporary_wav() -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    std::env::temp_dir().join(format!("audiocraft-speech-{}-{n}.wav", std::process::id()))
+    crate::prefs::temp_dir().join(format!("audiocraft-speech-{}-{n}.wav", std::process::id()))
 }
 
 /// Ready voices: (name, gender, which installed voice of that gender, pitch in semitones).

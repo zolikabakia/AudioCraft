@@ -501,21 +501,14 @@ pub fn import(path: &Path) -> Result<(Session, Vec<PathBuf>), String> {
     if let Some(fnode) = files_node {
         for f in children(fnode, "file") {
             let id = f.attribute("id").unwrap_or("").to_string();
+            // relative to the session first: the session only expects its library folder
+            // (the one holding it and all its media) to keep its inside, wherever it moves
             let abs = f.attribute("absolutePath").map(PathBuf::from);
-            let rel = f
-                .attribute("relativePath")
-                .map(|r| dir.join(r.replace('\\', "/")));
-            let by_name = abs
-                .as_ref()
-                .and_then(|a| a.file_name())
-                .map(|n| dir.join(n));
-            let chosen = [abs.clone(), rel.clone(), by_name]
-                .into_iter()
-                .flatten()
-                .find(|p| p.exists())
-                .or(abs)
-                .or(rel)
-                .unwrap_or_default();
+            let (chosen, _found) = crate::library::resolve(
+                &dir,
+                f.attribute("relativePath"),
+                abs.as_deref(),
+            );
             file_ids.push(id);
             files.push(chosen);
         }
@@ -605,6 +598,7 @@ pub fn import(path: &Path) -> Result<(Session, Vec<PathBuf>), String> {
             vol_env: vec![],
             show_vol_env: false,
             auto: Default::default(),
+            bus: false,
         };
         for cn in children(tn, "audioClip") {
             let fid = cn.attribute("fileID").unwrap_or("");
@@ -901,14 +895,13 @@ pub fn export(s: &Session, files: &[String], path: &Path) -> Result<(), String> 
     let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
     for (i, f) in files.iter().enumerate() {
         let p = PathBuf::from(f);
-        let rel = p
-            .strip_prefix(&dir)
-            .map(|r| r.to_string_lossy().replace('\\', "/"))
-            .unwrap_or_else(|_| {
-                p.file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default()
-            });
+        // relative to the session, climbing out with `..` when the media sits higher up the
+        // library folder; another drive has no relative way, so the name stands in
+        let rel = crate::library::relative(&dir, &p).unwrap_or_else(|| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default()
+        });
         x.push_str(&format!("    <file absolutePath=\"{}\" id=\"{}\" mediaHandler=\"AmioWav\" relativePath=\"{}\"/>\n", esc(&f.replace('\\', "/")), i, esc(&rel)));
     }
     x.push_str("  </files>\n</sesx>\n");

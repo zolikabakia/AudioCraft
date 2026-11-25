@@ -1120,7 +1120,194 @@ pub fn playhead() -> Color32 {
 /// indicator — a vivid red, light on dark themes and deep on light ones, so the vertical
 /// line a dragged edge is about to snap to stands out from the timeline in every theme.
 pub fn snap_line() -> Color32 {
+    let v = SNAP_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if v & 0x0100_0000 != 0 {
+        return Color32::from_rgb((v >> 16) as u8, (v >> 8) as u8, v as u8);
+    }
     palette().snap_indicator
+}
+
+/// The person's own snapping-line colour (Preferences > Multitrack), or the theme's.
+static SNAP_OVERRIDE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Use `c` for the snapping line instead of the theme's colour (`None`: the theme's again).
+pub fn set_snap_override(c: Option<[u8; 3]>) {
+    let v = c
+        .map(|c| 0x0100_0000 | (c[0] as u32) << 16 | (c[1] as u32) << 8 | c[2] as u32)
+        .unwrap_or(0);
+    SNAP_OVERRIDE.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The theme's own snapping-line colour (ignoring the person's override).
+pub fn theme_snap_line() -> Color32 {
+    palette().snap_indicator
+}
+
+/// A small floating bar beside the pointer that says what a drag is changing (a keyframe's
+/// value and how far it moved, a clip's gain...), in the popup style, above everything.
+pub fn drag_readout(ctx: &egui::Context, at: Pos2, text: &str) {
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Tooltip,
+        egui::Id::new("drag_readout"),
+    ));
+    let font = FontId::proportional(12.0);
+    let galley = painter.layout_no_wrap(text.to_string(), font, strong());
+    let pad = vec2(8.0, 5.0);
+    let size = galley.size() + pad * 2.0;
+    // beside and above the pointer, kept on screen
+    let screen = ctx.content_rect();
+    let mut min = at + vec2(16.0, -size.y - 10.0);
+    if min.x + size.x > screen.right() - 4.0 {
+        min.x = at.x - size.x - 16.0;
+    }
+    if min.y < screen.top() + 4.0 {
+        min.y = at.y + 18.0;
+    }
+    let r = Rect::from_min_size(min, size);
+    painter.rect_filled(r.translate(vec2(0.0, 2.0)), POPUP_ROUND, Color32::from_black_alpha(90));
+    painter.rect_filled(r, POPUP_ROUND, menu_fill());
+    painter.rect_stroke(r, POPUP_ROUND, Stroke::new(1.0, menu_edge()), egui::StrokeKind::Inside);
+    painter.galley(r.min + pad, galley, strong());
+}
+
+/// A colour swatch that opens a small picker under it: a saturation/brightness square and a
+/// hue strip, nothing else, in the app's popup style. True when the colour changed.
+pub fn colour_button(ui: &mut egui::Ui, id_salt: &str, rgb: &mut [u8; 3]) -> bool {
+    let (r, resp) = ui.allocate_exact_size(vec2(46.0, 20.0), Sense::click());
+    let c = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+    ui.painter().rect_filled(r, ROUND as f32, c);
+    ui.painter().rect_stroke(
+        r,
+        ROUND as f32,
+        Stroke::new(1.0, if resp.hovered() { text() } else { menu_edge() }),
+        egui::StrokeKind::Inside,
+    );
+    let resp = resp.on_hover_text("Pick a colour");
+    let id = ui.make_persistent_id(("colour_pick", id_salt));
+    let mut changed = false;
+    // a plain popup with the same margin on every side (a menu keeps room on the left for
+    // tick marks, which pushed the picker to the right)
+    egui::Popup::from_toggle_button_response(&resp)
+        .id(id)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .align(egui::RectAlign::BOTTOM_START)
+        .gap(4.0)
+        .width(200.0)
+        .frame(
+            egui::Frame::new()
+                .fill(menu_fill())
+                .stroke(Stroke::new(1.0, menu_edge()))
+                .corner_radius(POPUP_ROUND)
+                .inner_margin(egui::Margin::same(8)),
+        )
+        .layout(egui::Layout::top_down(egui::Align::Center))
+        .show(|ui| {
+            changed = colour_field(ui, id, rgb);
+        });
+    changed
+}
+
+/// The picker itself: a saturation (across) / brightness (up) square for the current hue and
+/// a hue strip under it, the same width, with even margins on both sides.
+pub fn colour_field(ui: &mut egui::Ui, id: egui::Id, rgb: &mut [u8; 3]) -> bool {
+    use egui::ecolor::Hsva;
+    // The picker keeps its own hue/saturation/brightness while the colour it made is still the
+    // one shown: worked back out of the 8-bit colour, the hue would jitter as the colour gets
+    // greyer, and a grey (no hue at all) would jump to red. Only a colour changed elsewhere (a
+    // swatch clicked) is read afresh.
+    let state_id = id.with("hsv");
+    let kept: Option<([u8; 3], [f32; 3])> = ui.data(|d| d.get_temp(state_id));
+    let mut hsv = match kept {
+        Some((c, [h, s, v])) if c == *rgb => Hsva::new(h, s, v, 1.0),
+        other => {
+            let mut x = Hsva::from(Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
+            if x.s < 0.01 || x.v < 0.01 {
+                // a grey keeps the hue the picker had
+                if let Some((_, [h, _, _])) = other {
+                    x.h = h;
+                }
+            }
+            x
+        }
+    };
+    let w = 200.0;
+    let mut changed = false;
+    // saturation / brightness square
+    let (sq, sr) = ui.allocate_exact_size(vec2(w, 140.0), Sense::click_and_drag());
+    let n = 16;
+    let mut mesh = egui::Mesh::default();
+    for yi in 0..=n {
+        for xi in 0..=n {
+            let (s, v) = (xi as f32 / n as f32, 1.0 - yi as f32 / n as f32);
+            let col: Color32 = Hsva::new(hsv.h, s, v, 1.0).into();
+            mesh.colored_vertex(
+                pos2(
+                    sq.left() + sq.width() * xi as f32 / n as f32,
+                    sq.top() + sq.height() * yi as f32 / n as f32,
+                ),
+                col,
+            );
+        }
+    }
+    let row = (n + 1) as u32;
+    for yi in 0..n as u32 {
+        for xi in 0..n as u32 {
+            let a = yi * row + xi;
+            mesh.add_triangle(a, a + 1, a + row);
+            mesh.add_triangle(a + 1, a + row + 1, a + row);
+        }
+    }
+    ui.painter().add(egui::Shape::mesh(mesh));
+    ui.painter()
+        .rect_stroke(sq, 0.0, Stroke::new(1.0, menu_edge()), egui::StrokeKind::Outside);
+    if let Some(p) = sr.interact_pointer_pos().filter(|_| sr.dragged() || sr.clicked()) {
+        hsv.s = ((p.x - sq.left()) / sq.width()).clamp(0.0, 1.0);
+        hsv.v = 1.0 - ((p.y - sq.top()) / sq.height()).clamp(0.0, 1.0);
+        changed = true;
+    }
+    let mk = pos2(sq.left() + hsv.s * sq.width(), sq.top() + (1.0 - hsv.v) * sq.height());
+    let ring = if hsv.v > 0.55 { Color32::BLACK } else { Color32::WHITE };
+    ui.painter().circle_stroke(mk, 5.0, Stroke::new(1.5, ring));
+    ui.add_space(6.0);
+    // hue strip
+    let (hr, hresp) = ui.allocate_exact_size(vec2(w, 14.0), Sense::click_and_drag());
+    let segs = 24;
+    let mut mesh = egui::Mesh::default();
+    for i in 0..=segs {
+        let h = i as f32 / segs as f32;
+        let col: Color32 = Hsva::new(h, 1.0, 1.0, 1.0).into();
+        let x = hr.left() + hr.width() * h;
+        mesh.colored_vertex(pos2(x, hr.top()), col);
+        mesh.colored_vertex(pos2(x, hr.bottom()), col);
+    }
+    for i in 0..segs as u32 {
+        let a = i * 2;
+        mesh.add_triangle(a, a + 1, a + 2);
+        mesh.add_triangle(a + 1, a + 3, a + 2);
+    }
+    ui.painter().add(egui::Shape::mesh(mesh));
+    ui.painter()
+        .rect_stroke(hr, 0.0, Stroke::new(1.0, menu_edge()), egui::StrokeKind::Outside);
+    if let Some(p) = hresp
+        .interact_pointer_pos()
+        .filter(|_| hresp.dragged() || hresp.clicked())
+    {
+        hsv.h = ((p.x - hr.left()) / hr.width()).clamp(0.0, 0.9999);
+        changed = true;
+    }
+    let hx = hr.left() + hsv.h * hr.width();
+    ui.painter().rect_stroke(
+        Rect::from_center_size(pos2(hx, hr.center().y), vec2(5.0, hr.height() + 4.0)),
+        1.0,
+        Stroke::new(1.5, Color32::WHITE),
+        egui::StrokeKind::Middle,
+    );
+    if changed {
+        let c: Color32 = hsv.into();
+        *rgb = [c.r(), c.g(), c.b()];
+    }
+    ui.data_mut(|d| d.insert_temp(state_id, (*rgb, [hsv.h, hsv.s, hsv.v])));
+    changed
 }
 /// The pre-render gauge's colours, taken from the theme so the bar matches every theme: the
 /// rendered part uses the theme's "on" colour (like a render bar's cached frames), the part
@@ -1381,6 +1568,8 @@ pub enum Icon {
     Lightning,
     /// Auto-play: a speaker with a play mark.
     AutoPlay,
+    /// Relink Media: a chain link.
+    Relink,
 }
 
 pub fn paint_icon(p: &egui::Painter, r: Rect, icon: Icon, col: Color32) {
@@ -1391,6 +1580,7 @@ pub fn paint_icon(p: &egui::Painter, r: Rect, icon: Icon, col: Color32) {
         Icon::Trash => Some(&crate::lucide::TRASH),
         Icon::Loop => Some(&crate::lucide::LOOP),
         Icon::AutoPlay => Some(&crate::lucide::AUTOPLAY),
+        Icon::Relink => Some(&crate::lucide::LINK),
         _ => None,
     };
     if let Some(d) = line {
@@ -1512,6 +1702,8 @@ pub fn paint_icon(p: &egui::Painter, r: Rect, icon: Icon, col: Color32) {
                 );
             }
         }
+        // drawn from its line icon above
+        Icon::Relink => {}
         Icon::AutoPlay => {
             // a small play mark, then a speaker with its sound waves
             let k = s / 9.0;

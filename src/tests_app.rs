@@ -1545,21 +1545,9 @@ fn grouped_clips_select_and_move_together() {
         s.selected_clip = Some(a);
     }
     h.run("clip.group").unwrap();
+    // (moving a group together is the clip drag's job: see selected_clips_drag_as_one_unit)
     let s = h.app.session.as_mut().unwrap();
     assert_eq!(s.group_of(a).len(), 2);
-    let start_b = {
-        let (t, i) = s.find_clip(b).unwrap();
-        s.tracks[t].clips[i].start
-    };
-    s.shift_group(a, 1.5);
-    let moved_b = {
-        let (t, i) = s.find_clip(b).unwrap();
-        s.tracks[t].clips[i].start
-    };
-    assert!(
-        (moved_b - start_b - 1.5).abs() < 1e-9,
-        "the other clip of the group moved"
-    );
     s.selected_clips.clear();
     s.select_group_of(b);
     assert_eq!(s.selected_clips.len(), 2, "picking one selects the group");
@@ -2738,7 +2726,15 @@ fn prerender_fills_the_whole_session_when_it_fits_the_cap() {
     );
     let g0 = h.app.prerender_gauge().expect("gauge shown");
     assert!(g0.busy && g0.progress < 0.5, "{g0:?}");
-    assert!(g0.window.0 < 1e-9 && g0.window.1 > 8.0, "the whole track: {g0:?}");
+    let first = h.app.session.as_ref().unwrap().tracks[0]
+        .clips
+        .iter()
+        .map(|c| c.start)
+        .fold(f64::INFINITY, f64::min);
+    assert!(
+        (g0.window.0 - first).abs() < 1e-9 && g0.window.1 > 8.0,
+        "the whole track, from its first clip: {g0:?}"
+    );
     h.app.finish_prerenders();
     let g = h.app.prerender_gauge().unwrap();
     let c = &h.app.prerender[&tid];
@@ -2767,7 +2763,11 @@ fn prerender_fills_the_whole_session_when_it_fits_the_cap() {
         .fold(0.0f32, |m, (x, y)| m.max((x - y).abs()));
     assert!(diff < 1e-3, "rendered playback matches live playback (diff {diff})");
     // an edit drops the stale render at once
-    h.app.session.as_mut().unwrap().tracks[0].clips[0].gain_db -= 3.0;
+    {
+        let s = h.app.session.as_mut().unwrap();
+        s.tracks[0].clips[0].gain_db -= 3.0;
+        s.touch();
+    }
     h.app.update_prerenders();
     assert!(!h.app.prerender.contains_key(&tid), "stale render forgotten");
     // the bar is drawn on the ruler, and goes away with Pre-render off
@@ -2802,18 +2802,90 @@ fn prerender_follows_the_playhead_within_the_cap() {
     let c = &h.app.prerender[&tid];
     assert!(c.rendered_to() >= 4.0 - 1e-6, "{}", c.rendered_to());
     assert!(c.start > 0.7 && c.start <= 1.0 + 1e-6, "trimmed to 1 s behind: {}", c.start);
-    // a jump far ahead starts over there
-    h.app.session.as_mut().unwrap().cursor = 6.0;
+    // a jump far ahead (more than the "ahead" distance) starts over AT the playhead
+    h.app.session.as_mut().unwrap().cursor = 7.0;
     h.app.finish_prerenders();
     let c = &h.app.prerender[&tid];
-    assert!((c.start - 5.0).abs() < 1e-3, "restarted 1 s behind: {}", c.start);
-    assert!(c.rendered_to() >= 8.0 - 1e-6, "{}", c.rendered_to());
+    assert!((c.start - 7.0).abs() < 1e-3, "restarted at the playhead: {}", c.start);
+    assert!(c.rendered_to() >= 8.5, "{}", c.rendered_to());
     let g = h.app.prerender_gauge().unwrap();
     assert!(
         g.megabytes <= g.cap_megabytes + 0.1,
         "stays within the cap: {g:?}"
     );
-    assert!((g.window.0 - 5.0).abs() < 1e-3, "{g:?}");
+    assert!((g.window.0 - 6.0).abs() < 1e-3, "1 s behind is the aim: {g:?}");
+    assert_eq!(g.ready.len(), 1, "{g:?}");
+    assert!((g.ready[0].0 - 7.0).abs() < 1e-3, "ready from the playhead on: {g:?}");
+}
+
+/// The person's report: a pre-render that holds the whole session shows as one bar the
+/// length of the session, from its first clip's start to its last clip's end, even when the
+/// pre-rendered tracks end at different times.
+#[test]
+fn a_whole_prerender_shows_the_whole_session() {
+    let mut h = Harness::new(true, true);
+    h.frames(2);
+    {
+        let s = h.app.session.as_mut().unwrap();
+        // start the first clip a little late, so "from the first clip" is not 0:00
+        for t in &mut s.tracks {
+            for c in &mut t.clips {
+                c.start += 0.5;
+            }
+        }
+        s.tracks[0].prerender = true;
+        s.tracks[1].prerender = true;
+        s.touch();
+    }
+    h.app.finish_prerenders();
+    let s = h.app.session.as_ref().unwrap();
+    let first = s.tracks.iter().flat_map(|t| t.clips.iter()).map(|c| c.start).fold(f64::INFINITY, f64::min);
+    let last = s.tracks.iter().flat_map(|t| t.clips.iter()).map(|c| c.end()).fold(0.0, f64::max);
+    let ends: Vec<f64> = s.tracks[..2]
+        .iter()
+        .map(|t| t.clips.iter().map(|c| c.end()).fold(0.0, f64::max))
+        .collect();
+    assert!((ends[0] - ends[1]).abs() > 0.3, "the two tracks end at different times: {ends:?}");
+    let g = h.app.prerender_gauge().unwrap();
+    assert!(!g.busy, "{g:?}");
+    assert!((g.span.0 - first).abs() < 1e-6, "starts at the first clip: {g:?}");
+    assert!((g.span.1 - last).abs() < 1e-3, "ends at the last clip: {g:?} vs {last}");
+    assert_eq!(g.ready.len(), 1, "one bar: {g:?}");
+    assert!((g.ready[0].0 - g.span.0).abs() < 1e-6 && (g.ready[0].1 - g.span.1).abs() < 1e-6, "{g:?}");
+}
+
+/// While playing, a following pre-render keeps up with the playhead: the playhead moving
+/// through the session (as playback moves it) is always inside rendered audio after a frame or
+/// two, and the render never keeps starting over.
+#[test]
+fn a_following_prerender_keeps_up_with_playback() {
+    let mut h = Harness::new(true, true);
+    h.frames(2);
+    h.app.prefs.prerender_cap_mb = 2.0;
+    h.app.prefs.prerender_ahead_s = 2.0;
+    h.app.prefs.prerender_behind_s = 1.0;
+    let tid = {
+        let s = h.app.session.as_mut().unwrap();
+        s.tracks[0].prerender = true;
+        s.touch();
+        s.tracks[0].id
+    };
+    let mut starts = vec![];
+    let mut t = 0.0;
+    while t < 8.0 {
+        h.app.session.as_mut().unwrap().cursor = t;
+        // one frame's worth of rendering (8 ms), as during playback
+        for _ in 0..3 {
+            h.app.prerender_tick(std::time::Duration::from_millis(8));
+        }
+        let c = &h.app.prerender[&tid];
+        if starts.last() != Some(&c.start) && c.start > t - 0.01 {
+            starts.push(c.start);
+        }
+        assert!(c.rendered_to() >= t, "at {t:.2} s the playhead is inside rendered audio ({})", c.rendered_to());
+        t += 1.0 / 60.0 * 3.0;
+    }
+    assert!(starts.len() <= 1, "it never started over while following: {starts:?}");
 }
 
 /// The render runs past the last clip until the effects have died away: a delay's echoes
@@ -2938,4 +3010,1733 @@ fn a_trimmed_clip_edge_snaps_to_clips_on_other_tracks() {
             );
         }
     }
+}
+
+// ---- library-based media links and Relink Media ---------------------------------
+
+/// The person's example: the sound sits in `smt/stm`, the session in `smt/stm/ggg`. Moving the
+/// whole `smt` folder under `gugugaga/pleple` must not break the session (.acsession and .sesx):
+/// it expects the sound relative to itself (`../rain.wav`), not at the old absolute path.
+#[test]
+fn a_session_opens_after_its_library_folder_moves() {
+    for ext in ["acsession", "sesx"] {
+        let base = std::env::temp_dir().join(format!("ac-lib-move-{}-{ext}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let ggg = base.join("smt/stm/ggg");
+        std::fs::create_dir_all(&ggg).unwrap();
+        let wav = base.join("smt/stm/rain.wav");
+        let d = crate::dsp::gen_tone(8000, 1, 0.5, 440.0, crate::dsp::Wave::Sine, -12.0);
+        crate::audio::save_wav(&wav, &d, 16, false).unwrap();
+        let mut h = Harness::new(false, true);
+        let lf = crate::audio::load(&wav).unwrap();
+        let id = h.app.add_file("rain.wav".into(), Some(wav.clone()), lf.data, 16, false, "test");
+        h.app.insert_into_multitrack(id);
+        let sess = ggg.join(format!("s.{ext}"));
+        h.app.session.as_mut().unwrap().path = Some(sess.clone());
+        h.app.save_session(false);
+        assert!(sess.exists(), "{ext} saved");
+        let txt = std::fs::read_to_string(&sess).unwrap();
+        assert!(txt.contains("../rain.wav"), "{ext} stores the link relative to itself:\n{txt}");
+        // move the whole tree somewhere else; the old place is gone
+        std::fs::create_dir_all(base.join("gugugaga/pleple")).unwrap();
+        std::fs::rename(base.join("smt"), base.join("gugugaga/pleple/smt")).unwrap();
+        assert!(!wav.exists());
+        let moved = base.join("gugugaga/pleple/smt/stm/ggg").join(format!("s.{ext}"));
+        let mut h = Harness::new(false, false);
+        h.app.load_session(&moved);
+        let s = h.app.session.as_ref().expect("opened");
+        assert_eq!(s.tracks.iter().map(|t| t.clips.len()).sum::<usize>(), 1, "{ext}: clip kept");
+        assert!(h.app.offline.is_empty(), "{ext}: nothing offline");
+        let f = h.app.files.iter().find(|f| f.name == "rain.wav").expect("file open");
+        let p = f.path.clone().unwrap();
+        assert_eq!(
+            crate::library::normalize(&p),
+            crate::library::normalize(&base.join("gugugaga/pleple/smt/stm/rain.wav")),
+            "{ext}: found at the new place"
+        );
+        assert!(f.data.duration() > 0.4);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+/// Missing media keeps its clips (offline placeholder, marked in Files, saved with its link),
+/// and Relink Media finds it in a folder and everything inside it and puts it back.
+#[test]
+fn offline_media_keeps_its_clips_and_relinks() {
+    let base = std::env::temp_dir().join(format!("ac-relink-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(base.join("proj")).unwrap();
+    std::fs::create_dir_all(base.join("elsewhere/deep/er")).unwrap();
+    let wav = base.join("proj/rain.wav");
+    let d = crate::dsp::gen_tone(8000, 1, 0.5, 440.0, crate::dsp::Wave::Sine, -12.0);
+    crate::audio::save_wav(&wav, &d, 16, false).unwrap();
+    let mut h = Harness::new(false, true);
+    let lf = crate::audio::load(&wav).unwrap();
+    let id = h.app.add_file("rain.wav".into(), Some(wav.clone()), lf.data, 16, false, "test");
+    h.app.insert_into_multitrack(id);
+    let sess = base.join("proj/s.acsession");
+    h.app.session.as_mut().unwrap().path = Some(sess.clone());
+    h.app.save_session(false);
+    // the media goes missing (moved somewhere unrelated)
+    let away = base.join("elsewhere/deep/er/rain.wav");
+    std::fs::rename(&wav, &away).unwrap();
+    let mut h = Harness::new(false, false);
+    h.app.load_session(&sess);
+    let fid = {
+        let s = h.app.session.as_ref().unwrap();
+        assert_eq!(s.tracks.iter().map(|t| t.clips.len()).sum::<usize>(), 1, "clip kept");
+        s.tracks.iter().flat_map(|t| t.clips.iter()).next().unwrap().file_id
+    };
+    assert!(h.app.offline.contains_key(&fid), "marked offline");
+    // saving keeps the expected link
+    h.app.save_session(false);
+    let txt = std::fs::read_to_string(&sess).unwrap();
+    assert!(txt.contains("rain.wav"), "the link survives a save");
+    // Relink Media: this folder only finds nothing, the whole tree finds it
+    h.app.open_relink("");
+    {
+        let st = h.app.relink.as_mut().unwrap();
+        assert_eq!(st.rows.len(), 1);
+        st.folder = base.join("elsewhere").display().to_string();
+        st.detect.recursive = false;
+    }
+    h.app.relink_search();
+    for _ in 0..200 {
+        h.app.relink_poll();
+        if h.app.relink.as_ref().unwrap().searching.is_none() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(h.app.relink.as_ref().unwrap().rows[0].found.is_empty(), "not in that folder itself");
+    h.app.relink.as_mut().unwrap().detect.recursive = true;
+    h.app.relink_search();
+    for _ in 0..200 {
+        h.app.relink_poll();
+        if h.app.relink.as_ref().unwrap().searching.is_none() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(h.app.relink.as_ref().unwrap().rows[0].found.len(), 1, "found inside");
+    h.app.relink_apply();
+    assert!(h.app.offline.is_empty(), "relinked");
+    let f = h.app.files.iter().find(|f| f.id == fid).expect("same file id");
+    assert_eq!(f.path.as_deref(), Some(away.as_path()));
+    assert!(f.data.duration() > 0.4, "real audio now");
+    // the window draws without trouble
+    h.frames(2);
+    // a file too short for its clips is refused when the length check is on
+    let short = base.join("short.wav");
+    let d = crate::dsp::gen_tone(8000, 1, 0.1, 440.0, crate::dsp::Wave::Sine, -12.0);
+    crate::audio::save_wav(&short, &d, 16, false).unwrap();
+    assert!(h.app.relink_file(fid, &short, true).is_err());
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The Relink Media button in the Files panel opens the window (and the File menu command too).
+#[test]
+fn the_relink_button_opens_relink_media() {
+    let mut h = Harness::new(true, true);
+    h.frames(2);
+    assert!(h.app.relink.is_none());
+    h.run("file.relink").unwrap();
+    assert!(h.app.relink.is_some(), "the command opens it");
+    h.frames(2);
+    h.app.relink = None;
+    h.app.pending_cmd = Some("cmd:file.relink");
+    h.frames(2);
+    assert!(h.app.relink.is_some(), "the Files panel button's command opens it");
+}
+
+fn ctrl_z(h: &mut Harness) {
+    let m = egui::Modifiers::CTRL | egui::Modifiers::COMMAND;
+    h.frames_with(
+        2,
+        vec![
+            egui::Event::ModifiersChanged(m),
+            egui::Event::Key {
+                key: egui::Key::Z,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: m,
+            },
+        ],
+    );
+    h.frames_with(1, vec![egui::Event::ModifiersChanged(Default::default())]);
+}
+
+/// The person's report: a moved keyframe (still selected) must go back with Ctrl+Z, and so
+/// must a moved curve handle.
+#[test]
+fn ctrl_z_undoes_a_keyframe_move() {
+    use crate::keys::EnvTarget;
+    for tool in [crate::app::Tool::Move, crate::app::Tool::Direct] {
+        let mut h = Harness::new(true, true);
+        h.app.tool = tool;
+        h.frames(2);
+        let b = h.app.session.as_ref().unwrap().tracks[0].clips[0].id;
+        let before = h.app.session.as_ref().unwrap().tracks[0].clips[0].env.clone();
+        let spot = h
+            .app
+            .multi_drag
+            .key_spots
+            .iter()
+            .find(|(t, i, _)| *t == EnvTarget::ClipVol(b) && *i == 1)
+            .map(|s| s.2)
+            .expect("keyframe drawn");
+        h.drag_mods(spot, Pos2::new(spot.x + 30.0, spot.y - 30.0), Default::default());
+        h.frames(3);
+        let moved = h.app.session.as_ref().unwrap().tracks[0].clips[0].env.clone();
+        assert_ne!(moved, before, "{tool:?}: the keyframe moved");
+        assert!(!h.app.multi_drag.key_sel.is_empty(), "{tool:?}: it stays selected");
+        ctrl_z(&mut h);
+        h.frames(3);
+        let after = h.app.session.as_ref().unwrap().tracks[0].clips[0].env.clone();
+        assert_eq!(after, before, "{tool:?}: Ctrl+Z put the keyframe back");
+    }
+}
+
+/// Ctrl+Z also puts back a dragged curve handle, and several keyframes moved together.
+#[test]
+fn ctrl_z_undoes_handle_and_group_moves() {
+    use crate::keys::EnvTarget;
+    // a curve handle (Direct tool)
+    let mut h = Harness::new(true, true);
+    h.app.tool = crate::app::Tool::Direct;
+    h.frames(2);
+    let b = {
+        let s = h.app.session.as_mut().unwrap();
+        let c = &mut s.tracks[0].clips[0];
+        let n = c.env.len();
+        c.curves.env_h = vec![crate::curves::Handles::smooth(0.3, 0.3); n];
+        s.touch();
+        c_id(s)
+    };
+    h.frames(3);
+    h.app.multi_drag.key_sel.only(EnvTarget::ClipVol(b), 1);
+    h.frames(3);
+    let before = h.app.session.as_ref().unwrap().tracks[0].clips[0].curves.env_h.clone();
+    let spot = h
+        .app
+        .multi_drag
+        .handle_spots
+        .iter()
+        .find(|(t, i, inside, _)| *t == EnvTarget::ClipVol(b) && *i == 1 && !*inside)
+        .map(|s| s.3)
+        .expect("the out handle is drawn");
+    h.drag_mods(spot, Pos2::new(spot.x + 25.0, spot.y - 25.0), Default::default());
+    h.frames(3);
+    let moved = h.app.session.as_ref().unwrap().tracks[0].clips[0].curves.env_h.clone();
+    assert_ne!(moved, before, "the handle moved");
+    ctrl_z(&mut h);
+    h.frames(3);
+    let after = h.app.session.as_ref().unwrap().tracks[0].clips[0].curves.env_h.clone();
+    assert_eq!(after, before, "Ctrl+Z put the handle back");
+
+    // two keyframes moved together
+    let mut h = Harness::new(true, true);
+    h.app.tool = crate::app::Tool::Move;
+    h.frames(2);
+    let b = c_id(h.app.session.as_mut().unwrap());
+    let before = h.app.session.as_ref().unwrap().tracks[0].clips[0].env.clone();
+    h.app.multi_drag.key_sel.only(EnvTarget::ClipVol(b), 1);
+    h.app.multi_drag.key_sel.toggle(EnvTarget::ClipVol(b), 2);
+    h.frames(3);
+    let spot = h
+        .app
+        .multi_drag
+        .key_spots
+        .iter()
+        .find(|(t, i, _)| *t == EnvTarget::ClipVol(b) && *i == 1)
+        .map(|s| s.2)
+        .unwrap();
+    h.drag_mods(spot, Pos2::new(spot.x + 20.0, spot.y + 20.0), Default::default());
+    h.frames(3);
+    assert_ne!(h.app.session.as_ref().unwrap().tracks[0].clips[0].env, before);
+    ctrl_z(&mut h);
+    h.frames(3);
+    assert_eq!(
+        h.app.session.as_ref().unwrap().tracks[0].clips[0].env,
+        before,
+        "Ctrl+Z put both keyframes back"
+    );
+}
+
+fn c_id(s: &mut crate::session::Session) -> u64 {
+    s.tracks[0].clips[0].id
+}
+
+/// Idle frames never change the session (or an undo would be followed by an automatic
+/// "Edit" step that redoes it): after drags, selections and Ctrl+Z, the history stands still.
+#[test]
+fn idle_frames_leave_the_session_alone() {
+    use crate::keys::EnvTarget;
+    for tool in [crate::app::Tool::Move, crate::app::Tool::Direct] {
+        let mut h = Harness::new(true, true);
+        h.app.tool = tool;
+        h.frames(4);
+        let b = c_id(h.app.session.as_mut().unwrap());
+        let spot = h
+            .app
+            .multi_drag
+            .key_spots
+            .iter()
+            .find(|(t, i, _)| *t == EnvTarget::ClipVol(b) && *i == 1)
+            .map(|s| s.2)
+            .unwrap();
+        h.drag_mods(spot, Pos2::new(spot.x + 30.0, spot.y - 30.0), Default::default());
+        h.frames(3);
+        for step in 0..3 {
+            let rev = h.app.session.as_ref().unwrap().revision;
+            let n = h.app.session_hist.len();
+            let pos = h.app.session_hist_pos;
+            h.frames(5);
+            let s = h.app.session.as_ref().unwrap();
+            assert_eq!(
+                (s.revision, h.app.session_hist.len(), h.app.session_hist_pos),
+                (rev, n, pos),
+                "{tool:?} step {step}: idle frames changed the session ({:?})",
+                h.app.session_hist.iter().map(|x| x.0.clone()).collect::<Vec<_>>()
+            );
+            ctrl_z(&mut h);
+            h.frames(2);
+        }
+    }
+}
+
+/// After Ctrl+Z the keyframe is also *drawn* back where it was (not only stored there).
+#[test]
+fn ctrl_z_redraws_the_keyframe_where_it_was() {
+    use crate::keys::EnvTarget;
+    for tool in [crate::app::Tool::Move, crate::app::Tool::Direct] {
+        let mut h = Harness::new(true, true);
+        h.app.tool = tool;
+        h.frames(3);
+        let b = c_id(h.app.session.as_mut().unwrap());
+        let spot_of = |h: &Harness| {
+            h.app
+                .multi_drag
+                .key_spots
+                .iter()
+                .find(|(t, i, _)| *t == EnvTarget::ClipVol(b) && *i == 1)
+                .map(|s| s.2)
+                .unwrap()
+        };
+        let spot = spot_of(&h);
+        h.drag_mods(spot, Pos2::new(spot.x + 30.0, spot.y - 30.0), Default::default());
+        h.frames(3);
+        assert!((spot_of(&h) - spot).length() > 10.0, "{tool:?}: drawn moved");
+        ctrl_z(&mut h);
+        h.frames(3);
+        assert!(
+            (spot_of(&h) - spot).length() < 0.5,
+            "{tool:?}: drawn back at {:?}, was {:?}",
+            spot_of(&h),
+            spot
+        );
+    }
+}
+
+/// A person's drag: real time, many small moves, a rest, then release.
+fn slow_drag(h: &mut Harness, from: Pos2, to: Pos2) {
+    if h.clock.is_none() {
+        h.clock = Some(100.0);
+    }
+    let press = |pos: Pos2, pressed: bool| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: Default::default(),
+    };
+    h.frames_with(1, vec![egui::Event::PointerMoved(from)]);
+    h.frames_with(3, vec![]);
+    h.frames_with(1, vec![press(from, true)]);
+    for k in 1..=30 {
+        let p = from + (to - from) * (k as f32 / 30.0);
+        h.frames_with(1, vec![egui::Event::PointerMoved(p)]);
+    }
+    h.frames_with(10, vec![]);
+    h.frames_with(1, vec![press(to, false)]);
+    h.frames_with(10, vec![]);
+}
+
+/// The same undo checks with a real-time drag (click-vs-drag timing as on screen), several
+/// times in a row, for keyframes and handles.
+#[test]
+fn ctrl_z_undoes_real_time_keyframe_and_handle_drags() {
+    use crate::keys::EnvTarget;
+    for tool in [crate::app::Tool::Move, crate::app::Tool::Direct] {
+        let mut h = Harness::new(true, true);
+        h.app.tool = tool;
+        h.clock = Some(100.0);
+        h.frames(5);
+        let b = c_id(h.app.session.as_mut().unwrap());
+        if tool == crate::app::Tool::Direct {
+            let s = h.app.session.as_mut().unwrap();
+            let n = s.tracks[0].clips[0].env.len();
+            s.tracks[0].clips[0].curves.env_h = vec![crate::curves::Handles::smooth(0.3, 0.3); n];
+            s.touch();
+            h.frames(5);
+        }
+        let start = h.app.session.as_ref().unwrap().tracks[0].clips[0].clone();
+        let mut states = vec![(start.env.clone(), start.curves.env_h.clone())];
+        for round in 0..3 {
+            let spot = h
+                .app
+                .multi_drag
+                .key_spots
+                .iter()
+                .find(|(t, i, _)| *t == EnvTarget::ClipVol(b) && *i == 1)
+                .map(|s| s.2)
+                .unwrap();
+            // click to select first, like a person, then drag
+            slow_drag(&mut h, spot, spot);
+            let grab = if tool == crate::app::Tool::Direct && round == 1 {
+                h.app
+                    .multi_drag
+                    .handle_spots
+                    .iter()
+                    .find(|(t, i, inside, _)| *t == EnvTarget::ClipVol(b) && *i == 1 && !*inside)
+                    .map(|s| s.3)
+                    .expect("handle drawn")
+            } else {
+                spot
+            };
+            slow_drag(&mut h, grab, grab + egui::vec2(20.0, -15.0 - round as f32 * 5.0));
+            let c = &h.app.session.as_ref().unwrap().tracks[0].clips[0];
+            let now = (c.env.clone(), c.curves.env_h.clone());
+            assert_ne!(&now, states.last().unwrap(), "{tool:?} round {round}: it moved");
+            states.push(now);
+        }
+        for k in (0..3).rev() {
+            ctrl_z(&mut h);
+            h.frames(5);
+            let c = &h.app.session.as_ref().unwrap().tracks[0].clips[0];
+            assert_eq!(
+                (c.env.clone(), c.curves.env_h.clone()),
+                states[k],
+                "{tool:?}: Ctrl+Z #{} went back one move ({:?} at {})",
+                3 - k,
+                h.app.session_hist.iter().map(|x| x.0.clone()).collect::<Vec<_>>(),
+                h.app.session_hist_pos
+            );
+        }
+    }
+}
+
+/// Ctrl+Z after moving keyframes of every other envelope kind: clip pan, a track's automation
+/// lane, the Master lane.
+#[test]
+fn ctrl_z_undoes_lane_and_pan_keyframe_moves() {
+    use crate::keys::{EnvTarget, env_of};
+    for which in 0..3 {
+        let mut h = Harness::new(true, true);
+        h.app.tool = crate::app::Tool::Move;
+        h.clock = Some(100.0);
+        h.frames(3);
+        let target = {
+            let s = h.app.session.as_mut().unwrap();
+            let t0 = s.tracks[0].id;
+            let cid = s.tracks[0].clips[0].id;
+            match which {
+                0 => {
+                    let l = s.tracks[0].clips[0].len;
+                    s.tracks[0].clips[0].pan_env = vec![(l * 0.2, 0.0), (l * 0.5, 0.5), (l * 0.8, 0.0)];
+                    s.tracks[0].clips[0].curves.pan_h.clear();
+                    EnvTarget::ClipPan(cid)
+                }
+                1 => {
+                    s.tracks[0].show_vol_env = true;
+                    s.tracks[0].io.automation = 1;
+                    s.tracks[0].vol_env = vec![(1.0, 0.0), (3.0, -6.0), (5.0, 0.0)];
+                    s.tracks[0].auto.vol_h.clear();
+                    EnvTarget::TrackVol(t0)
+                }
+                _ => {
+                    s.master.show_vol_env = true;
+                    s.master.automation = 1;
+                    s.master.vol_env = vec![(1.0, 0.0), (3.0, -6.0), (5.0, 0.0)];
+                    s.master.vol_h.clear();
+                    EnvTarget::MasterVol
+                }
+            }
+        };
+        h.app.session.as_mut().unwrap().touch();
+        h.frames(5);
+        let env = |h: &Harness| {
+            env_of(h.app.session.as_ref().unwrap(), target)
+                .map(|(e, hs)| (e.clone(), hs.clone()))
+                .unwrap()
+        };
+        let before = env(&h);
+        let Some(spot) = h
+            .app
+            .multi_drag
+            .key_spots
+            .iter()
+            .find(|(t, i, _)| *t == target && *i == 1)
+            .map(|s| s.2)
+        else {
+            panic!("{target:?}: keyframe not drawn")
+        };
+        slow_drag(&mut h, spot, spot + egui::vec2(15.0, -12.0));
+        assert_ne!(env(&h), before, "{target:?}: moved");
+        ctrl_z(&mut h);
+        h.frames(5);
+        assert_eq!(
+            env(&h),
+            before,
+            "{target:?}: Ctrl+Z put it back ({:?} at {})",
+            h.app.session_hist.iter().map(|x| x.0.clone()).collect::<Vec<_>>(),
+            h.app.session_hist_pos
+        );
+    }
+}
+
+/// The person's report: in a thin window the workspace names and the search box ran over the
+/// tools. Now the right end gives things up (app name, other tabs, search width, the search
+/// box) and always stays inside the room the tools leave.
+#[test]
+fn a_thin_window_never_overlaps_the_toolbar() {
+    let mut last_shown = usize::MAX;
+    for w in [1800.0, 1300.0, 1100.0, 950.0, 850.0, 760.0, 700.0] {
+        let mut h = Harness::new(true, true).with_size(w, 900.0);
+        h.frames(4);
+        let p = h.app.extra.toolbar_plan.clone().expect("toolbar drawn");
+        assert!(p.fits, "width {w}: the right end runs over the tools: {p:?}");
+        assert!(p.shown.len() <= last_shown, "width {w}: fewer tabs as it narrows");
+        last_shown = p.shown.len();
+        if w >= 1800.0 {
+            assert!(p.label && !p.search_icon && p.shown.len() >= 3, "wide: everything: {p:?}");
+        }
+    }
+    let mut h = Harness::new(true, true).with_size(700.0, 900.0);
+    h.frames(4);
+    let p = h.app.extra.toolbar_plan.clone().unwrap();
+    assert!(!p.label, "a thin window drops the app name first: {p:?}");
+}
+
+/// The person's order for a shrinking track: the middle rows go first, then the automation
+/// row (the lane's arrow and Read); the volume/pan row stays the longest. The arrow is there
+/// down to about 84 points and answers; below that it has given way to volume/pan.
+#[test]
+fn the_automation_row_survives_short_tracks() {
+    for height in [86.0f32, 100.0, 110.0] {
+        let mut h = Harness::new(true, true);
+        {
+            let s = h.app.session.as_mut().unwrap();
+            for t in &mut s.tracks {
+                t.height = height;
+            }
+            s.touch();
+        }
+        h.frames(3);
+        let (rect, rows, _) = h.app.multi_drag.geom.clone().expect("layout");
+        // the arrow sits at the header's bottom-left, just right of the colour strip
+        let p = Pos2::new(rect.left() - 222.0 + 8.0 + 8.0, rows[0].bottom() - 15.0);
+        let before = h.app.session.as_ref().unwrap().tracks[0].show_vol_env;
+        h.click(p);
+        h.frames(2);
+        let after = h.app.session.as_ref().unwrap().tracks[0].show_vol_env;
+        assert_ne!(before, after, "height {height}: the lane arrow is there and answers");
+    }
+}
+
+/// Saving never stacks extensions: a session whose path already has them doubled is written as
+/// one clean name, and its name in the Files panel carries no extension.
+#[test]
+fn saving_never_stacks_session_extensions() {
+    let dir = std::env::temp_dir().join(format!("ac-savename-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut h = Harness::new(false, true);
+    let d = crate::dsp::gen_tone(8000, 1, 0.2, 440.0, crate::dsp::Wave::Sine, -12.0);
+    let id = h.app.add_file("take.wav".into(), None, d, 16, true, "test");
+    h.app.insert_into_multitrack(id);
+    {
+        let s = h.app.session.as_mut().unwrap();
+        s.name = "xyz.sesx".into();
+        s.path = Some(dir.join("xyz.sesx.sesx"));
+    }
+    h.app.save_session(false);
+    assert!(dir.join("xyz.sesx").exists(), "written as xyz.sesx");
+    assert!(!dir.join("xyz.sesx.sesx").exists(), "never xyz.sesx.sesx");
+    let s = h.app.session.as_ref().unwrap();
+    assert_eq!(s.name, "xyz");
+    assert_eq!(s.path.as_deref(), Some(dir.join("xyz.sesx").as_path()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Below the automation row's room it gives way first (volume/pan keeps its row).
+#[test]
+fn the_automation_row_goes_before_volume_and_pan() {
+    let mut h = Harness::new(true, true);
+    {
+        let s = h.app.session.as_mut().unwrap();
+        for t in &mut s.tracks {
+            t.height = 64.0;
+        }
+        s.touch();
+    }
+    h.frames(3);
+    let (rect, rows, _) = h.app.multi_drag.geom.clone().expect("layout");
+    let p = Pos2::new(rect.left() - 222.0 + 8.0 + 8.0, rows[0].bottom() - 15.0);
+    let before = h.app.session.as_ref().unwrap().tracks[0].show_vol_env;
+    h.click(p);
+    h.frames(2);
+    assert_eq!(
+        h.app.session.as_ref().unwrap().tracks[0].show_vol_env,
+        before,
+        "a 64-point track shows volume/pan, not the lane arrow"
+    );
+}
+
+/// Like the time after the session's end, there is blank room under the last track: the
+/// tracks scroll up past it even when they only just fill the view.
+#[test]
+fn tracks_scroll_past_the_last_one() {
+    let mut h = Harness::new(true, true);
+    h.frames(3);
+    h.app.multi_drag.scroll_y = f32::MAX;
+    h.frames(3);
+    let (_, rows, _) = h.app.multi_drag.geom.clone().expect("layout");
+    let (lanes, _, _) = h.app.multi_drag.geom.clone().unwrap();
+    let last = rows.last().copied().unwrap();
+    assert!(h.app.multi_drag.scroll_y > 0.0, "it scrolls");
+    assert!(
+        last.bottom() < lanes.bottom() - 50.0,
+        "blank room under the last track: {} vs {}",
+        last.bottom(),
+        lanes.bottom()
+    );
+}
+
+/// The snapping line can have the person's own colour (Preferences > Multitrack), and goes
+/// back to the theme's when that is cleared.
+#[test]
+fn the_snapping_line_colour_can_be_picked() {
+    let theme = crate::theme::snap_line();
+    crate::theme::set_snap_override(Some([10, 200, 30]));
+    assert_eq!(crate::theme::snap_line(), egui::Color32::from_rgb(10, 200, 30));
+    assert_eq!(crate::theme::theme_snap_line(), theme);
+    crate::theme::set_snap_override(None);
+    assert_eq!(crate::theme::snap_line(), theme);
+    let mut h = Harness::new(true, true);
+    let mut p = h.app.prefs.clone();
+    p.snap_line_color = Some([1, 2, 3]);
+    h.app.apply_prefs_live(p);
+    assert_eq!(crate::theme::snap_line(), egui::Color32::from_rgb(1, 2, 3));
+    let mut p = h.app.prefs.clone();
+    p.snap_line_color = None;
+    h.app.apply_prefs_live(p);
+    assert_eq!(crate::theme::snap_line(), theme);
+    crate::theme::set_snap_override(None);
+}
+
+/// The person's report: making the colour grey in the picker (dragging to the left of its
+/// square) must not move the hue marker or turn the hue red; the picker keeps its hue.
+#[test]
+fn the_colour_picker_keeps_its_hue_when_grey() {
+    let ctx = egui::Context::default();
+    let mut rgb = [46u8, 170, 140]; // a teal
+    let start_hue = egui::ecolor::Hsva::from(egui::Color32::from_rgb(46, 170, 140)).h;
+    let id = egui::Id::new("pick_test");
+    let mut top_left = Pos2::ZERO;
+    let mut frame = |events: Vec<egui::Event>, rgb: &mut [u8; 3], tl: &mut Pos2| {
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(400.0, 400.0))),
+            events,
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| {
+            egui::CentralPanel::default().show_inside(ui, |ui| {
+                *tl = ui.cursor().min;
+                crate::theme::colour_field(ui, id, rgb);
+            });
+        });
+        // no GPU here: the font atlas upload is dropped on purpose
+        out.textures_delta.clear();
+    };
+    frame(vec![], &mut rgb, &mut top_left);
+    frame(vec![], &mut rgb, &mut top_left);
+    // press inside the square, drag to its left edge (no saturation), release
+    let a = top_left + vec2(150.0, 40.0);
+    let b = top_left + vec2(-30.0, 40.0);
+    let btn = |pos: Pos2, pressed: bool| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: Default::default(),
+    };
+    frame(vec![egui::Event::PointerMoved(a), btn(a, true)], &mut rgb, &mut top_left);
+    for k in 1..=10 {
+        let p = a + (b - a) * (k as f32 / 10.0);
+        frame(vec![egui::Event::PointerMoved(p)], &mut rgb, &mut top_left);
+    }
+    frame(vec![btn(b, false)], &mut rgb, &mut top_left);
+    frame(vec![], &mut rgb, &mut top_left);
+    assert!(rgb[0] == rgb[1] && rgb[1] == rgb[2], "fully grey now: {rgb:?}");
+    let kept: Option<([u8; 3], [f32; 3])> = ctx.data(|d| d.get_temp(id.with("hsv")));
+    let (_, [h, s, _]) = kept.expect("the picker keeps its state");
+    assert!(s < 0.01);
+    assert!(
+        (h - start_hue).abs() < 0.02,
+        "the hue stayed teal ({h} vs {start_hue}), it did not jump to red"
+    );
+}
+
+/// The person's requests: Alt+wheel over the clips resizes every track (the plain wheel already
+/// scrolls them), and scrolling is never logged in the undo history: Ctrl+Z after it neither
+/// adds nor undoes anything about the heights.
+#[test]
+fn alt_wheel_resizes_the_tracks() {
+    let mut h = Harness::new(true, true);
+    h.clock = Some(10.0);
+    h.frames(3);
+    let (lanes, _, _) = h.app.multi_drag.geom.clone().expect("layout");
+    let over = lanes.center();
+    let heights = |h: &Harness| -> Vec<f32> {
+        h.app.session.as_ref().unwrap().tracks.iter().map(|t| t.height).collect()
+    };
+    let before = heights(&h);
+    let steps = h.app.session_hist.len();
+    let wheel = |dy: f32| egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: vec2(0.0, dy),
+        phase: egui::TouchPhase::Move,
+        source: egui::MouseWheelSource::Unknown,
+        modifiers: egui::Modifiers::ALT,
+    };
+    for _ in 0..4 {
+        h.frames_with(
+            1,
+            vec![
+                egui::Event::PointerMoved(over),
+                egui::Event::ModifiersChanged(egui::Modifiers::ALT),
+                wheel(60.0),
+            ],
+        );
+        h.frames_with(4, vec![egui::Event::ModifiersChanged(egui::Modifiers::ALT)]);
+    }
+    h.frames_with(10, vec![egui::Event::ModifiersChanged(Default::default())]);
+    let after = heights(&h);
+    assert!(
+        after.iter().zip(&before).all(|(a, b)| a > b),
+        "every track grew: {before:?} -> {after:?}"
+    );
+    assert_eq!(h.app.multi_drag.scroll_y, 0.0, "Alt+wheel did not scroll");
+    assert_eq!(h.app.session_hist.len(), steps, "scrolling is not an undo step");
+    ctrl_z(&mut h);
+    h.frames(2);
+    assert_eq!(heights(&h), after, "Ctrl+Z leaves the scrolled heights alone");
+    // an edit after scrolling, then Ctrl+Z: the edit goes, the heights stay
+    {
+        let s = h.app.session.as_mut().unwrap();
+        s.tracks[0].clips[0].gain_db += 3.0;
+        s.touch();
+    }
+    h.frames(3);
+    assert_eq!(h.app.session_hist.len(), steps + 1, "the edit is one step");
+    ctrl_z(&mut h);
+    h.frames(2);
+    let s = h.app.session.as_ref().unwrap();
+    assert!(s.tracks[0].clips[0].gain_db.abs() < 1e-6, "the edit was undone");
+    assert_eq!(heights(&h), after, "and the heights stayed as scrolled");
+}
+
+// ---- MCP (AI assistants) ------------------------------------------------------------
+
+fn mcp_call(h: &mut Harness, id: u64, name: &str, args: serde_json::Value) -> (bool, String) {
+    let ctx = h.ctx.clone();
+    let msg = serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+        "params": {"name": name, "arguments": args}});
+    let r = h.app.mcp_handle(&msg, &ctx).expect("an answer");
+    let res = &r["result"];
+    (
+        res["isError"].as_bool().unwrap_or(true),
+        res["content"][0]["text"].as_str().unwrap_or("").to_string(),
+    )
+}
+
+/// The MCP protocol answers (initialize, tools/list, notifications), and every guardrail
+/// holds: the permission level, commands that are never available, saving only to a place the
+/// person chose, the rate limit, and edits that are one undo step.
+#[test]
+fn mcp_answers_and_keeps_its_guardrails() {
+    use serde_json::json;
+    let mut h = Harness::new(true, true);
+    h.frames(2);
+    let ctx = h.ctx.clone();
+    let init = h
+        .app
+        .mcp_handle(
+            &json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}}}),
+            &ctx,
+        )
+        .unwrap();
+    assert_eq!(init["result"]["protocolVersion"], "2025-06-18");
+    assert_eq!(init["result"]["serverInfo"]["name"], "AudioCraft");
+    assert!(
+        h.app
+            .mcp_handle(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}), &ctx)
+            .is_none()
+    );
+    let list = h
+        .app
+        .mcp_handle(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}), &ctx)
+        .unwrap();
+    let names: Vec<&str> = list["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    for n in [
+        "get_state",
+        "list_tracks",
+        "list_commands",
+        "run_command",
+        "set_playhead",
+        "set_selection",
+        "set_track",
+    ] {
+        assert!(names.contains(&n), "{n}");
+    }
+    let bad = h
+        .app
+        .mcp_handle(&json!({"jsonrpc": "2.0", "id": 3, "method": "no/such"}), &ctx)
+        .unwrap();
+    assert_eq!(bad["error"]["code"], -32601);
+
+    // read only: looking works, changing does not
+    h.app.prefs.mcp_level = 0;
+    let (err, text) = mcp_call(&mut h, 4, "get_state", json!({}));
+    assert!(!err && text.contains("Multitrack"), "{text}");
+    let (err, text) = mcp_call(&mut h, 5, "list_tracks", json!({}));
+    assert!(!err && text.contains("Demo"), "{text}");
+    let (err, text) = mcp_call(&mut h, 6, "set_playhead", json!({"seconds": 2.0}));
+    assert!(err && text.contains("Navigate"), "{text}");
+
+    // navigate & play
+    h.app.prefs.mcp_level = 1;
+    let (err, _) = mcp_call(&mut h, 7, "set_playhead", json!({"seconds": 2.0}));
+    assert!(!err);
+    assert!((h.app.cursor() - 2.0).abs() < 1e-6);
+    let (err, text) = mcp_call(&mut h, 8, "set_track", json!({"track": 0, "volume_db": -6}));
+    assert!(err && text.contains("Edit"), "{text}");
+    let (err, text) = mcp_call(&mut h, 9, "set_selection", json!({"start": 3.0, "end": 1.0}));
+    assert!(err && text.contains("after"), "{text}");
+
+    // never: quitting, dialogs, unknown commands, at any level
+    h.app.prefs.mcp_level = 3;
+    for id in ["file.exit", "file.open", "nope.nothing"] {
+        let (err, text) = mcp_call(&mut h, 10, "run_command", json!({ "id": id }));
+        assert!(err, "{id}: {text}");
+    }
+    // saving only where the person already saved
+    let (err, text) = mcp_call(&mut h, 11, "run_command", json!({"id": "file.save"}));
+    assert!(err && text.contains("yourself"), "{text}");
+
+    // edit: one undoable step
+    h.app.prefs.mcp_level = 2;
+    h.app.prefs.mcp_confirm = false;
+    let before = h.app.session.as_ref().unwrap().tracks[0].volume_db;
+    let steps = h.app.session_hist.len();
+    let (err, text) = mcp_call(
+        &mut h,
+        12,
+        "set_track",
+        json!({"track": 0, "volume_db": -6.5, "name": "Lead\u{7}"}),
+    );
+    assert!(!err, "{text}");
+    let t = &h.app.session.as_ref().unwrap().tracks[0];
+    assert_eq!(t.volume_db, -6.5);
+    assert_eq!(t.name, "Lead", "control characters are dropped");
+    assert_eq!(h.app.session_hist.len(), steps + 1);
+    let (err, _) = mcp_call(&mut h, 13, "run_command", json!({"id": "edit.undo"}));
+    assert!(!err);
+    assert_eq!(
+        h.app.session.as_ref().unwrap().tracks[0].volume_db,
+        before,
+        "undone"
+    );
+    let (err, text) = mcp_call(&mut h, 14, "set_track", json!({"track": 99, "mute": true}));
+    assert!(err && text.contains("99"), "{text}");
+
+    // the rate limit
+    h.app.prefs.mcp_rate_per_min = 3;
+    h.app.mcp.calls.clear();
+    for k in 0..3 {
+        let (err, _) = mcp_call(&mut h, 20 + k, "get_state", json!({}));
+        assert!(!err);
+    }
+    let (err, text) = mcp_call(&mut h, 30, "get_state", json!({}));
+    assert!(err && text.contains("too many"), "{text}");
+}
+
+/// Over a real connection: the token is required, a web page (another Origin) is turned away,
+/// only POST /mcp is served, and with "Ask me before each change" an edit waits for Allow.
+#[test]
+fn mcp_over_http_needs_the_token_and_waits_for_allow() {
+    use serde_json::json;
+    let mut h = Harness::new(true, true);
+    h.app.prefs.mcp_enabled = true;
+    h.app.prefs.mcp_port = 0; // any free port
+    h.app.prefs.mcp_token = "t".repeat(40);
+    h.app.prefs.mcp_level = 2;
+    h.app.prefs.mcp_confirm = true;
+    h.frames(2);
+    let port = h.app.mcp.server.as_ref().expect("listening").port;
+    assert!(h.app.mcp.status.contains("Listening"), "{}", h.app.mcp.status);
+    let token = h.app.prefs.mcp_token.clone();
+    let raw = |req: String| -> String {
+        use std::io::{Read, Write};
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.write_all(req.as_bytes()).unwrap();
+        let mut out = String::new();
+        let _ = s.read_to_string(&mut out);
+        out
+    };
+    let body = json!({"jsonrpc": "2.0", "id": 1, "method": "ping"}).to_string();
+    // no token
+    let r = raw(format!(
+        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    ));
+    assert!(r.starts_with("HTTP/1.1 401"), "{r}");
+    // a web page's origin
+    let r = raw(format!(
+        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: https://web.page.example\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    ));
+    assert!(r.starts_with("HTTP/1.1 403"), "{r}");
+    // GET is not served
+    let r = raw(format!(
+        "GET /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\n\r\n"
+    ));
+    assert!(r.starts_with("HTTP/1.1 405"), "{r}");
+    // a good ping, answered by the app's frame loop
+    let worker = std::thread::spawn({
+        let token = token.clone();
+        let body = body.clone();
+        move || crate::mcp::post(port, &token, &body)
+    });
+    let mut answer = None;
+    for _ in 0..400 {
+        h.frames(1);
+        if worker.is_finished() {
+            answer = Some(worker.join().unwrap());
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let (code, text) = answer.expect("answered").unwrap();
+    assert_eq!(code, 200, "{text}");
+    assert!(text.contains("\"result\""), "{text}");
+    // an edit waits for the person
+    let edit = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": "set_track", "arguments": {"track": 1, "mute": true}}})
+    .to_string();
+    let worker = std::thread::spawn({
+        let token = token.clone();
+        move || crate::mcp::post(port, &token, &edit)
+    });
+    for _ in 0..400 {
+        h.frames(1);
+        if !h.app.mcp.pending.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(h.app.mcp.pending.len(), 1, "waiting for Allow");
+    assert!(
+        !h.app.session.as_ref().unwrap().tracks[1].mute,
+        "nothing changed yet"
+    );
+    let ctx = h.ctx.clone();
+    h.app.mcp_decide(1, &ctx);
+    let (code, text) = worker.join().unwrap().unwrap();
+    assert_eq!(code, 200);
+    assert!(text.contains("\"isError\":false"), "{text}");
+    assert!(
+        h.app.session.as_ref().unwrap().tracks[1].mute,
+        "allowed and done"
+    );
+    // turning MCP off stops the server
+    h.app.prefs.mcp_enabled = false;
+    h.frames(2);
+    assert!(h.app.mcp.server.is_none());
+}
+
+/// The newer MCP rules (2025-06-18 / 2025-11-25): version negotiation, tool titles and hints,
+/// structured results with output schemas, an unknown tool as a protocol error, client
+/// responses and bad ids handled.
+#[test]
+fn mcp_follows_the_newer_protocol() {
+    use serde_json::json;
+    let mut h = Harness::new(true, true);
+    h.frames(2);
+    let ctx = h.ctx.clone();
+    let ask = |h: &mut Harness, m: serde_json::Value| h.app.mcp_handle(&m, &ctx);
+    for (asked, given) in [
+        ("2025-11-25", "2025-11-25"),
+        ("2025-03-26", "2025-03-26"),
+        ("1999-01-01", "2025-11-25"),
+    ] {
+        let r = ask(&mut h, json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": asked, "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}}}))
+        .unwrap();
+        assert_eq!(r["result"]["protocolVersion"], given, "{asked}");
+        assert!(r["result"]["serverInfo"]["title"].is_string());
+    }
+    let list = ask(&mut h, json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})).unwrap();
+    let tools = list["result"]["tools"].as_array().unwrap().clone();
+    let tool = |n: &str| tools.iter().find(|t| t["name"] == n).unwrap().clone();
+    assert_eq!(tool("get_state")["annotations"]["readOnlyHint"], true);
+    assert_eq!(tool("run_command")["annotations"]["destructiveHint"], true);
+    assert_eq!(tool("set_playhead")["annotations"]["idempotentHint"], true);
+    for n in ["get_state", "list_tracks", "list_commands"] {
+        assert_eq!(tool(n)["outputSchema"]["type"], "object", "{n}");
+    }
+    // data comes as structured content too, matching the output schema's required fields
+    h.app.prefs.mcp_level = 3;
+    let call = |h: &mut Harness, n: &str, a: serde_json::Value| {
+        h.app
+            .mcp_handle(
+                &json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": n, "arguments": a}}),
+                &h.ctx.clone(),
+            )
+            .unwrap()
+    };
+    let r = call(&mut h, "get_state", json!({}));
+    assert_eq!(r["result"]["structuredContent"]["editor"], "Multitrack");
+    for k in tool("get_state")["outputSchema"]["required"].as_array().unwrap() {
+        assert!(r["result"]["structuredContent"].get(k.as_str().unwrap()).is_some(), "{k}");
+    }
+    let r = call(&mut h, "list_tracks", json!({}));
+    assert!(r["result"]["structuredContent"]["tracks"].as_array().unwrap().len() > 1);
+    let r = call(&mut h, "list_commands", json!({}));
+    assert!(!r["result"]["structuredContent"]["commands"].as_array().unwrap().is_empty());
+    // a plain text answer has no structured content
+    let r = call(&mut h, "set_playhead", json!({"seconds": 1.0}));
+    assert!(r["result"].get("structuredContent").is_none());
+    assert_eq!(r["result"]["isError"], false);
+    // an unknown tool or bad arguments: a protocol error
+    let r = call(&mut h, "no_such_tool", json!({}));
+    assert_eq!(r["error"]["code"], -32602);
+    let r = call(&mut h, "set_playhead", json!([1, 2]));
+    assert_eq!(r["error"]["code"], -32602);
+    // a client's response, and requests with a bad id or version
+    assert!(ask(&mut h, json!({"jsonrpc": "2.0", "id": 9, "result": {}})).is_none());
+    let r = ask(&mut h, json!({"jsonrpc": "2.0", "id": null, "method": "ping"})).unwrap();
+    assert_eq!(r["error"]["code"], -32600);
+    let r = ask(&mut h, json!({"jsonrpc": "1.0", "id": 4, "method": "ping"})).unwrap();
+    assert_eq!(r["error"]["code"], -32600);
+    // an older client's batch still works, but never with initialize in it
+    let r = ask(&mut h, json!([{"jsonrpc": "2.0", "id": 5, "method": "ping"},
+        {"jsonrpc": "2.0", "method": "notifications/initialized"}]))
+    .unwrap();
+    assert_eq!(r.as_array().unwrap().len(), 1);
+    let r = ask(&mut h, json!([{"jsonrpc": "2.0", "id": 6, "method": "initialize", "params": {}}])).unwrap();
+    assert_eq!(r["error"]["code"], -32600);
+}
+
+/// Over HTTP: initialize gives a session id and the bridge sends it back with the version;
+/// an unknown session is 404 (and the bridge recovers), an unknown version 400, batches from
+/// newer clients 400, and DELETE ends a session.
+#[test]
+fn mcp_http_sessions_and_versions() {
+    use serde_json::json;
+    let mut h = Harness::new(true, true);
+    h.app.prefs.mcp_enabled = true;
+    h.app.prefs.mcp_port = 0;
+    h.app.prefs.mcp_token = "s".repeat(40);
+    h.app.prefs.mcp_level = 1;
+    h.app.prefs.mcp_confirm = false;
+    h.frames(2);
+    let port = h.app.mcp.server.as_ref().expect("listening").port;
+    let token = h.app.prefs.mcp_token.clone();
+    // a request the app answers in its frame loop
+    let pump = |h: &mut Harness, body: String, link: crate::mcp::Link| {
+        let token = token.clone();
+        let worker = std::thread::spawn(move || {
+            let mut link = link;
+            let r = crate::mcp::post_in(port, &token, &body, &mut link);
+            (r, link)
+        });
+        for _ in 0..400 {
+            h.frames(1);
+            if worker.is_finished() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let (r, link) = worker.join().unwrap();
+        (r.unwrap(), link)
+    };
+    let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}}})
+    .to_string();
+    let ((code, text), link) = pump(&mut h, init, crate::mcp::Link::default());
+    assert_eq!(code, 200, "{text}");
+    let sid = link.session.clone().expect("a session id");
+    assert_eq!(link.version.as_deref(), Some("2025-11-25"));
+    // within the session
+    let ping = json!({"jsonrpc": "2.0", "id": 2, "method": "ping"}).to_string();
+    let ((code, text), _) = pump(&mut h, ping.clone(), link.clone());
+    assert_eq!(code, 200, "{text}");
+    // answered before the app is asked: no frames needed
+    let mut stale = crate::mcp::Link {
+        session: Some("0".repeat(32)),
+        version: Some("2025-11-25".into()),
+    };
+    let (code, _) = crate::mcp::post_in(port, &token, &ping, &mut stale).unwrap();
+    assert_eq!(code, 404, "an unknown session");
+    let mut odd = crate::mcp::Link {
+        session: None,
+        version: Some("1999-01-01".into()),
+    };
+    let (code, text) = crate::mcp::post_in(port, &token, &ping, &mut odd).unwrap();
+    assert_eq!(code, 400, "an unknown version: {text}");
+    let batch = json!([{"jsonrpc": "2.0", "id": 3, "method": "ping"}]).to_string();
+    let (code, text) = crate::mcp::post_in(port, &token, &batch, &mut link.clone()).unwrap();
+    assert_eq!(code, 400, "no batches in 2025-11-25: {text}");
+    // DELETE ends the session
+    let raw = |req: String| -> String {
+        use std::io::{Read, Write};
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.write_all(req.as_bytes()).unwrap();
+        let mut out = String::new();
+        let _ = s.read_to_string(&mut out);
+        out
+    };
+    let del = format!(
+        "DELETE /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nMcp-Session-Id: {sid}\r\n\r\n"
+    );
+    assert!(raw(del.clone()).starts_with("HTTP/1.1 200"));
+    assert!(raw(del).starts_with("HTTP/1.1 404"));
+    let (code, _) = crate::mcp::post_in(port, &token, &ping, &mut link.clone()).unwrap();
+    assert_eq!(code, 404, "the ended session is gone");
+    // a page posting a form is turned away
+    let r = raw(format!(
+        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{ping}",
+        ping.len()
+    ));
+    assert!(r.starts_with("HTTP/1.1 415"), "{r}");
+    h.app.prefs.mcp_enabled = false;
+    h.frames(2);
+}
+
+/// One track volume range everywhere (-60..+15 dB): a +15 dB track can be set by an assistant,
+/// stays +15 dB with the Properties panel showing it, and louder asks stop at +15.
+#[test]
+fn every_track_volume_control_shares_one_range() {
+    use serde_json::json;
+    let mut h = Harness::new(true, true);
+    h.frames(2);
+    h.app.prefs.mcp_level = 2;
+    h.app.prefs.mcp_confirm = false;
+    let (err, text) = mcp_call(&mut h, 1, "set_track", json!({"track": 0, "volume_db": 15}));
+    assert!(!err, "{text}");
+    assert_eq!(h.app.session.as_ref().unwrap().tracks[0].volume_db, 15.0);
+    let (err, _) = mcp_call(&mut h, 2, "set_track", json!({"track": 0, "volume_db": 40}));
+    assert!(!err);
+    assert_eq!(
+        h.app.session.as_ref().unwrap().tracks[0].volume_db,
+        crate::session::TRACK_DB_MAX
+    );
+    let ctx = h.ctx.clone();
+    let list = h
+        .app
+        .mcp_handle(&json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}), &ctx)
+        .unwrap();
+    let max = list["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "set_track")
+        .unwrap()["inputSchema"]["properties"]["volume_db"]["maximum"]
+        .as_f64()
+        .unwrap();
+    assert_eq!(max, 15.0, "the tool says the same range");
+    // the Properties panel showing the track never turns it down
+    h.app.show_panel(crate::workspace::PanelId::Properties);
+    h.frames(4);
+    assert_eq!(h.app.session.as_ref().unwrap().tracks[0].volume_db, 15.0);
+}
+
+/// The person's request: while a keyframe is dragged a small floating bar says its value and
+/// how far it moved (dB for volume, L/R for pan...) and where in time it is; it goes away on
+/// release.
+#[test]
+fn dragging_a_keyframe_shows_its_value_and_change() {
+    use crate::keys::EnvTarget;
+    let mut h = Harness::new(true, true);
+    h.app.tool = crate::app::Tool::Move;
+    h.frames(3);
+    let b = c_id(h.app.session.as_mut().unwrap());
+    let spot = h
+        .app
+        .multi_drag
+        .key_spots
+        .iter()
+        .find(|(t, i, _)| *t == EnvTarget::ClipVol(b) && *i == 1)
+        .map(|s| s.2)
+        .expect("keyframe drawn");
+    assert!(h.app.multi_drag.readout.is_none(), "nothing before a drag");
+    let press = |pos: Pos2, pressed: bool| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: Default::default(),
+    };
+    h.frames_with(1, vec![egui::Event::PointerMoved(spot), press(spot, true)]);
+    let to = spot + vec2(12.0, -30.0);
+    h.frames_with(1, vec![egui::Event::PointerMoved(spot + vec2(6.0, -15.0))]);
+    h.frames_with(1, vec![egui::Event::PointerMoved(to)]);
+    let (_, text) = h.app.multi_drag.readout.clone().expect("the readout shows while dragging");
+    assert!(text.contains("dB"), "{text}");
+    assert!(text.contains("(+"), "it says how far the point moved up: {text}");
+    assert!(text.contains(" s)"), "and how far in time: {text}");
+    h.frames_with(2, vec![press(to, false)]);
+    h.frames(1);
+    assert!(h.app.multi_drag.readout.is_none(), "gone after release");
+    // the change text speaks each kind's unit
+    use crate::keys::{VKind, delta_text};
+    assert_eq!(delta_text(VKind::Vol, -3.04), "-3.0 dB");
+    assert_eq!(delta_text(VKind::Pan, 0.25), "25 to R");
+    assert_eq!(delta_text(VKind::Pan, -0.1), "10 to L");
+    assert_eq!(delta_text(VKind::Fade, 0.5), "+50 %");
+}
+
+/// A drag with the given modifiers held all the way: press, move in steps, release.
+fn drag_held(h: &mut Harness, from: Pos2, to: Pos2, mods: egui::Modifiers) {
+    let press = |pos: Pos2, pressed: bool| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: mods,
+    };
+    h.frames_with(
+        1,
+        vec![egui::Event::ModifiersChanged(mods), egui::Event::PointerMoved(from), press(from, true)],
+    );
+    for k in 1..=10 {
+        let p = from + (to - from) * (k as f32 / 10.0);
+        h.frames_with(1, vec![egui::Event::ModifiersChanged(mods), egui::Event::PointerMoved(p)]);
+    }
+    h.frames_with(2, vec![egui::Event::ModifiersChanged(mods), press(to, false)]);
+    h.frames_with(1, vec![egui::Event::ModifiersChanged(Default::default())]);
+}
+
+/// The person's request: holding Ctrl while dragging a keyframe or a clip moves it at a
+/// fifth of the mouse's speed, for precise placing.
+#[test]
+fn ctrl_slows_dragging_for_precision() {
+    use crate::keys::EnvTarget;
+    let ctrl = egui::Modifiers::CTRL | egui::Modifiers::COMMAND;
+    // a keyframe: the same mouse travel moves its value about a fifth as far with Ctrl
+    let key_move = |mods: egui::Modifiers| -> f32 {
+        let mut h = Harness::new(true, true);
+        h.app.tool = crate::app::Tool::Move;
+        h.app.snapping = false;
+        h.frames(3);
+        let b = c_id(h.app.session.as_mut().unwrap());
+        let before = h.app.session.as_ref().unwrap().tracks[0].clips[0].env[1].1;
+        let spot = h
+            .app
+            .multi_drag
+            .key_spots
+            .iter()
+            .find(|(t, i, _)| *t == EnvTarget::ClipVol(b) && *i == 1)
+            .map(|s| s.2)
+            .unwrap();
+        drag_held(&mut h, spot, spot + vec2(0.0, -40.0), mods);
+        h.frames(2);
+        let _ = before;
+        // how far it moved on screen (the dB scale is not linear, the screen is)
+        let after = h
+            .app
+            .multi_drag
+            .key_spots
+            .iter()
+            .find(|(t, i, _)| *t == EnvTarget::ClipVol(b) && *i == 1)
+            .map(|s| s.2)
+            .unwrap();
+        spot.y - after.y
+    };
+    let free = key_move(Default::default());
+    let fine = key_move(ctrl);
+    assert!(free > 1.0, "the free drag moved the keyframe up: {free}");
+    let ratio = fine / free;
+    assert!((0.1..0.35).contains(&ratio), "Ctrl moves about a fifth as far: {fine} vs {free}");
+    // a clip: the same along the timeline
+    let clip_move = |mods: egui::Modifiers| -> f64 {
+        let mut h = Harness::new(true, true);
+        h.app.tool = crate::app::Tool::Move;
+        h.app.snapping = false;
+        h.frames(3);
+        let s = h.app.session.as_ref().unwrap();
+        let c = &s.tracks[1].clips[1];
+        let (id, before) = (c.id, c.start);
+        let (rect, rows, view) = h.app.multi_drag.geom.clone().unwrap();
+        let t = c.start + c.len * 0.5;
+        let x = rect.left() + ((t - view.0) / (view.1 - view.0)) as f32 * rect.width();
+        let from = Pos2::new(x, rows[1].center().y + 20.0);
+        drag_held(&mut h, from, from + vec2(100.0, 0.0), mods);
+        let s = h.app.session.as_ref().unwrap();
+        let (ti, ci) = s.find_clip(id).expect("the clip");
+        s.tracks[ti].clips[ci].start - before
+    };
+    let free = clip_move(Default::default());
+    let fine = clip_move(ctrl);
+    assert!(free > 0.3, "the free drag moved the clip: {free}");
+    let ratio = fine / free;
+    assert!((0.1..0.35).contains(&ratio), "Ctrl moves the clip about a fifth as far: {fine} vs {free}");
+}
+
+// ---- inputs and outputs ---------------------------------------------------------------
+
+/// The person's request: several inputs and outputs, kept simple. A track sent to a hardware
+/// pair ("Out 3/4") plays out of those channels instead of the Master during playback, while a
+/// mixdown still holds it; a track sent to "None" is silent.
+#[test]
+fn a_track_can_go_straight_to_a_hardware_output_pair() {
+    let h = Harness::new(true, true);
+    let mut s = h.app.session.clone().unwrap();
+    assert_eq!(crate::session::output_pair("Out 3/4"), Some(2));
+    assert_eq!(crate::session::output_pair("Master"), None);
+    // only the beat track (track 2) plays, sent to outputs 3/4
+    s.tracks[0].mute = true;
+    s.tracks[1].io.output = "Out 3/4".into();
+    let files = &h.app.files;
+    let look = |id: u64| files.iter().find(|f| f.id == id).map(|f| f.data.clone());
+    let mix = s.snapshot(&look);
+    assert_eq!(mix.tracks[1].direct, Some(2));
+    let peak = |b: &[f32]| b.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    // live playback: the Master is silent, channels 3/4 carry the track
+    let mut live = crate::session::ChainCache::live();
+    live.sync(&mix, s.rate as f32);
+    let (mut out, mut tmp, mut pk) = (vec![], vec![], vec![]);
+    crate::session::render_mix(&mix, &mut live, s.rate as f32, 0.5, 4096, &mut out, &mut tmp, &mut pk);
+    assert!(peak(&out[0]) < 1e-6 && peak(&out[1]) < 1e-6, "not in the Master");
+    assert!(live.direct.len() >= 4, "buffers for outputs 1-4");
+    assert!(peak(&live.direct[2]) > 1e-3 && peak(&live.direct[3]) > 1e-3, "on outputs 3/4");
+    // a mixdown keeps every track
+    let d = crate::session::mixdown(&mix, s.rate, 0.5, 0.6);
+    assert!(peak(&d.ch[0]) > 1e-3, "the export holds the track");
+    // "None": silent
+    s.tracks[1].io.output = "None".into();
+    let mix = s.snapshot(&look);
+    let d = crate::session::mixdown(&mix, s.rate, 0.5, 0.6);
+    assert!(peak(&d.ch[0]) < 1e-6, "a track sent nowhere is silent");
+}
+
+/// Inputs: the menus list every stereo pair and every single input of the device, and a
+/// multichannel recording becomes each track's own take (mono input: one channel; pair: two).
+#[test]
+fn tracks_record_from_any_input_or_pair() {
+    let mut h = Harness::new(true, true);
+    h.app.engine.in_known = 4;
+    let ins = h.app.input_choices();
+    assert_eq!(
+        ins,
+        vec![
+            "Stereo In 1/2",
+            "Stereo In 3/4",
+            "Mono In 1",
+            "Mono In 2",
+            "Mono In 3",
+            "Mono In 4"
+        ]
+    );
+    assert_eq!(h.app.output_pairs(), vec!["Out 1/2"], "a stereo device has one pair");
+    let mut rec = crate::audio::AudioData::new(48000, 4, 10);
+    for (c, ch) in rec.ch.iter_mut().enumerate() {
+        for v in ch.iter_mut() {
+            *v = c as f32 + 1.0;
+        }
+    }
+    let mono = crate::app::input_take(&rec, crate::extras::input_channels("Mono In 3"));
+    assert_eq!(mono.channels(), 1);
+    assert_eq!(mono.ch[0][0], 3.0, "input 3");
+    let pair = crate::app::input_take(&rec, crate::extras::input_channels("Stereo In 3/4"));
+    assert_eq!(pair.channels(), 2);
+    assert_eq!((pair.ch[0][0], pair.ch[1][0]), (3.0, 4.0), "inputs 3 and 4");
+    // a choice past the device's last input falls back to the last one
+    let far = crate::app::input_take(&rec, crate::extras::input_channels("Mono In 9"));
+    assert_eq!(far.ch[0][0], 4.0);
+}
+
+/// Preferences that used to be saved but read by nothing now take effect: the session's
+/// history limit, new tracks' lane height and Pre-render, automatic crossfades, and how the
+/// view follows playback.
+#[test]
+fn once_dead_preferences_now_take_effect() {
+    let mut p = crate::prefs::Prefs::default();
+    p.history_limit = 5;
+    p.default_lane_height = 200.0;
+    p.pre_render_tracks = true;
+    p.auto_crossfade = false;
+    p.auto_scroll_mode = 1;
+    crate::prefs::set_live(&p);
+    // new tracks
+    let mut s = crate::session::Session::new("t", 48000, 0);
+    s.add_track(true);
+    assert!(s.tracks[0].prerender, "new tracks start pre-rendered when asked");
+    assert_eq!(s.tracks[0].auto.lane_h, 200.0);
+    // no automatic crossfade: two overlapping clips keep plain fades
+    let mut h = Harness::new(true, true);
+    // starting the app applies its own (default) preferences: ask for ours again
+    crate::prefs::set_live(&p);
+    {
+        let s = h.app.session.as_mut().unwrap();
+        let c0 = s.tracks[1].clips[0].clone();
+        s.tracks[1].clips[1].start = c0.start + c0.len * 0.5;
+    }
+    let fades = crate::session::effective_fades(&h.app.session.as_ref().unwrap().tracks[1]);
+    assert!(!fades[0].3 && !fades[1].2, "no crossfade while the setting is off: {fades:?}");
+    crate::prefs::set_live(&crate::prefs::Prefs::default());
+    let fades = crate::session::effective_fades(&h.app.session.as_ref().unwrap().tracks[1]);
+    assert!(fades[0].3 && fades[1].2, "the automatic crossfade is back: {fades:?}");
+    // the history limit
+    crate::prefs::set_live(&p);
+    for _ in 0..12 {
+        h.app.session.as_mut().unwrap().tracks[0].volume_db -= 0.5;
+        h.app.session_push("Edit");
+    }
+    assert!(h.app.session_hist.len() <= 5, "{}", h.app.session_hist.len());
+    crate::prefs::set_live(&crate::prefs::Prefs::default());
+    // following the playhead
+    use crate::prefs::follow_view;
+    assert_eq!(follow_view((0.0, 10.0), 4.0, None, 0), None, "page mode: still in view");
+    assert_eq!(follow_view((0.0, 10.0), 11.0, None, 0), Some((11.0, 21.0)), "a new page");
+    assert_eq!(follow_view((0.0, 10.0), 4.0, None, 1), None, "centred: before the middle");
+    assert_eq!(follow_view((0.0, 10.0), 6.0, None, 1), Some((1.0, 11.0)), "centred: held mid");
+    assert_eq!(follow_view((0.0, 10.0), 50.0, None, 2), None, "off");
+    assert_eq!(follow_view((0.0, 10.0), 11.0, Some(8.0), 0), Some((8.0, 18.0)), "file end");
+}
+
+/// Auto Save: a backup copy of a changed session is written beside it, the newest few are
+/// kept, and a backup opens with its clips.
+#[test]
+fn auto_save_writes_and_prunes_backups() {
+    let dir = std::env::temp_dir().join(format!("ac-autosave-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut h = Harness::new(true, true);
+    h.app.prefs.autosave_keep = 2;
+    h.app.session.as_mut().unwrap().path = Some(dir.join("s.acsession"));
+    // the demo audio gets a place on disk with the first save; then the session changes
+    h.app.save_session(false);
+    let clips: usize = h.app.session.as_ref().unwrap().tracks.iter().map(|t| t.clips.len()).sum();
+    assert!(clips > 0);
+    let p1 = h.app.write_backup().expect("backup 1");
+    assert!(p1.exists() && p1.parent().unwrap().ends_with("Backups"), "{}", p1.display());
+    let _p2 = h.app.write_backup().expect("backup 2");
+    let p3 = h.app.write_backup().expect("backup 3");
+    let left: Vec<_> = std::fs::read_dir(dir.join("Backups")).unwrap().flatten().collect();
+    assert_eq!(left.len(), 2, "only the newest two are kept");
+    assert!(!p1.exists(), "the oldest went");
+    // the backup opens with every clip
+    let mut h2 = Harness::new(false, false);
+    h2.app.load_session(&p3);
+    let s2 = h2.app.session.as_ref().expect("the backup opened");
+    assert_eq!(s2.tracks.iter().map(|t| t.clips.len()).sum::<usize>(), clips);
+    assert!(h2.app.offline.is_empty(), "its audio was found");
+    // the timer: due, and the session changed since the last backup
+    h.app.prefs.autosave_on = true;
+    h.app.prefs.autosave_minutes = 1;
+    h.app.autosave_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(61));
+    {
+        let s = h.app.session.as_mut().unwrap();
+        s.tracks[0].volume_db = -3.0;
+        s.touch();
+    }
+    // (the harness runs in screenshot mode, where timers like this stay quiet)
+    let shot = h.app.screenshot.take();
+    h.app.autosave_tick();
+    assert!(h.app.status.starts_with("Backup saved"), "{}", h.app.status);
+    // nothing changed: no second backup at the next due time
+    let n_before = std::fs::read_dir(dir.join("Backups")).unwrap().count();
+    h.app.autosave_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(61));
+    h.app.status.clear();
+    h.app.autosave_tick();
+    assert!(!h.app.status.starts_with("Backup saved"), "{}", h.app.status);
+    assert_eq!(std::fs::read_dir(dir.join("Backups")).unwrap().count(), n_before);
+    h.app.screenshot = shot;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Data preferences: a smooth delete crossfades the seam, dither is added to 16-bit files when
+/// on (and not when off), and 32-bit float files above 0 dBFS are clipped on open when asked.
+#[test]
+fn data_preferences_dither_clip_and_smooth_delete() {
+    // smooth delete
+    let mut d = crate::audio::AudioData::new(1000, 1, 1000);
+    for (i, v) in d.ch[0].iter_mut().enumerate() {
+        *v = if i < 500 { 1.0 } else { -1.0 };
+    }
+    let plain = d.without_smooth(400, 600, 0);
+    assert_eq!(plain.frames(), 800);
+    assert_eq!((plain.ch[0][399], plain.ch[0][400]), (1.0, -1.0), "a plain cut jumps");
+    let smooth = d.without_smooth(400, 600, 10);
+    assert_eq!(smooth.frames(), 790, "the two sides overlap by the fade");
+    let seam = &smooth.ch[0][390..400];
+    assert!(seam.iter().all(|v| v.abs() < 1.0), "the seam passes through the middle: {seam:?}");
+    assert!(seam[0] > 0.5 && seam[9] < -0.5, "from one side to the other: {seam:?}");
+    // dither
+    let tmp = std::env::temp_dir().join(format!("ac-dither-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp);
+    let mut c = crate::audio::AudioData::new(8000, 1, 2000);
+    for v in c.ch[0].iter_mut() {
+        *v = 0.3;
+    }
+    let mut p = crate::prefs::Prefs::default();
+    p.dither_on = false;
+    crate::prefs::set_live(&p);
+    crate::audio::save_wav(&tmp.join("flat.wav"), &c, 16, false).unwrap();
+    let flat = crate::audio::load(&tmp.join("flat.wav")).unwrap().data;
+    assert!(flat.ch[0].windows(2).all(|w| w[0] == w[1]), "no dither: every sample the same");
+    p.dither_on = true;
+    p.dither_depth = 1.0;
+    crate::prefs::set_live(&p);
+    crate::audio::save_wav(&tmp.join("dith.wav"), &c, 16, false).unwrap();
+    let dith = crate::audio::load(&tmp.join("dith.wav")).unwrap().data;
+    assert!(dith.ch[0].windows(2).any(|w| w[0] != w[1]), "dither: the samples vary");
+    let lsb = 1.0 / 32767.0;
+    assert!(dith.ch[0].iter().all(|v| (v - 0.3).abs() < 3.0 * lsb), "by a bit or two only");
+    // float clip on open
+    let mut hot = crate::audio::AudioData::new(8000, 1, 100);
+    for v in hot.ch[0].iter_mut() {
+        *v = 1.5;
+    }
+    crate::audio::save_wav(&tmp.join("hot.wav"), &hot, 32, true).unwrap();
+    p.interpret_float_clip = false;
+    crate::prefs::set_live(&p);
+    assert_eq!(crate::audio::load(&tmp.join("hot.wav")).unwrap().data.ch[0][0], 1.5);
+    p.interpret_float_clip = true;
+    crate::prefs::set_live(&p);
+    assert_eq!(crate::audio::load(&tmp.join("hot.wav")).unwrap().data.ch[0][0], 1.0);
+    crate::prefs::set_live(&crate::prefs::Prefs::default());
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Effects preferences: a newly added effect starts at the default mix.
+#[test]
+fn new_effects_start_at_the_default_mix() {
+    let mut h = Harness::new(true, true);
+    let mut p = crate::prefs::Prefs::default();
+    p.fx_default_mix = 40.0;
+    crate::prefs::set_live(&p);
+    h.app.rack_insert(
+        crate::rack::RackTarget::Track(0),
+        None,
+        crate::dsp::Effect::Delay {
+            time_ms: 100.0,
+            feedback: 0.3,
+            mix: 0.5,
+        },
+    );
+    let slot = h.app.session.as_ref().unwrap().tracks[0].rack.last().cloned().unwrap();
+    assert!((slot.mix - 0.4).abs() < 1e-6, "{}", slot.mix);
+    crate::prefs::set_live(&crate::prefs::Prefs::default());
+}
+
+/// Multitrack Clips preferences: the default crossfade curve, smooth curves through fade
+/// points, and "play overlapped portions" (off: a clip under a later one is not heard there).
+#[test]
+fn clip_preferences_shape_fades_and_overlaps() {
+    let mut p = crate::prefs::Prefs::default();
+    // the default crossfade curve
+    p.default_crossfade_curve = 0;
+    crate::prefs::set_live(&p);
+    assert!(crate::session::default_fade_table(true, 0.0).is_empty(), "equal power: built in");
+    p.default_crossfade_curve = 1;
+    crate::prefs::set_live(&p);
+    let lin = crate::session::default_fade_table(true, 0.0);
+    assert!((crate::session::fade_at(&lin, 0.5, true) - 0.5).abs() < 1e-4, "linear");
+    p.default_crossfade_curve = 2;
+    crate::prefs::set_live(&p);
+    let log = crate::session::default_fade_table(true, 0.0);
+    let mid = crate::session::fade_at(&log, 0.5, true);
+    assert!(mid < 0.1, "logarithmic: about -24 dB halfway ({mid})");
+    assert!(crate::session::default_fade_table(false, 0.0).is_empty(), "plain fades untouched");
+    // smooth curves through a fade point
+    let pts = [(0.5, 0.2f32)];
+    p.clip_fade_points_smooth = false;
+    crate::prefs::set_live(&p);
+    let straight = crate::curves::fade_gain(&pts, &[], 0.25, &|x| x as f32);
+    assert!(straight > 0.0 && straight < 0.2, "between the ends when off: {straight}");
+    p.clip_fade_points_smooth = true;
+    crate::prefs::set_live(&p);
+    let smooth = crate::curves::fade_gain(&pts, &[], 0.25, &|x| x as f32);
+    assert!((smooth - straight).abs() > 1e-3, "a smooth curve when on: {smooth}");
+    // overlaps
+    let mut s = crate::session::Session::new("t", 48000, 0);
+    s.add_track(true);
+    let mk = |id: u64, start: f64, len: f64| crate::session::Clip {
+        id,
+        file_id: 1,
+        name: String::new(),
+        start,
+        offset: 0.0,
+        len,
+        gain_db: 0.0,
+        muted: false,
+        env: vec![],
+        pan_env: vec![],
+        rack: vec![],
+        speed: 1.0,
+        fx: Default::default(),
+        auto_in: true,
+        auto_out: true,
+        curves: Default::default(),
+        fade_in: 0.0,
+        fade_out: 0.0,
+    };
+    s.tracks[0].clips = vec![mk(1, 0.0, 4.0), mk(2, 1.0, 1.0)];
+    p.play_overlap = false;
+    crate::prefs::set_live(&p);
+    let t = &s.tracks[0];
+    let hidden = crate::session::hidden_ranges(t, &crate::session::effective_fades(t));
+    assert_eq!(hidden[0], vec![(1.0, 2.0)], "the long clip is silent under the short one");
+    assert!(hidden[1].is_empty());
+    // a partial overlap with an automatic crossfade plays both
+    s.tracks[0].clips = vec![mk(1, 0.0, 2.0), mk(2, 1.5, 2.0)];
+    let t = &s.tracks[0];
+    let hidden = crate::session::hidden_ranges(t, &crate::session::effective_fades(t));
+    assert!(hidden.iter().all(|h| h.is_empty()), "crossfades play both: {hidden:?}");
+    p.play_overlap = true;
+    crate::prefs::set_live(&p);
+    s.tracks[0].clips = vec![mk(1, 0.0, 4.0), mk(2, 1.0, 1.0)];
+    let t = &s.tracks[0];
+    let hidden = crate::session::hidden_ranges(t, &crate::session::effective_fades(t));
+    assert!(hidden.iter().all(|h| h.is_empty()), "on: everything plays");
+    crate::prefs::set_live(&crate::prefs::Prefs::default());
+}
+
+/// Playback preferences: Multitrack playback stops after the last clip once the sound has
+/// died away (or runs on when that is off), and Play with Pre-roll and Post-roll plays the
+/// selection with the extra time around it.
+#[test]
+fn playback_preferences_stop_at_end_and_preroll() {
+    let mut h = Harness::new(true, true);
+    h.frames(2);
+    let len = h.app.session.as_ref().unwrap().length();
+    h.app.prefs.stop_at_end = true;
+    h.app.session.as_mut().unwrap().cursor = len - 0.5;
+    h.app.play();
+    assert_eq!(h.app.engine.lock().stop_after, Some(len));
+    // the audio thread's work, by hand
+    let rate = h.app.engine.lock().out_rate as f64;
+    let mut played = 0.0;
+    while h.app.engine.lock().playing && played < 10.0 {
+        h.app.engine.lock().render(1024);
+        played += 1024.0 / rate;
+    }
+    let pos = h.app.engine.lock().pos;
+    assert!(!h.app.engine.lock().playing, "it stopped");
+    assert!(pos > len && pos < len + 4.0, "after the last clip, once quiet: {pos} vs {len}");
+    h.app.stop();
+    h.app.prefs.stop_at_end = false;
+    h.app.session.as_mut().unwrap().cursor = 0.0;
+    h.app.play();
+    assert_eq!(h.app.engine.lock().stop_after, None, "off: it runs on");
+    h.app.stop();
+    // pre-roll and post-roll around the selection
+    h.app.prefs.preroll_s = 1.0;
+    h.app.prefs.postroll_s = 0.5;
+    {
+        let s = h.app.session.as_mut().unwrap();
+        s.selection = Some((2.0, 3.0));
+        s.cursor = 2.0;
+    }
+    h.app.exec("transport.play_preroll", &h.ctx.clone()).unwrap();
+    let e = h.app.engine.lock();
+    assert!(e.playing);
+    assert!((e.pos - 1.0).abs() < 1e-6 && (e.end - 3.5).abs() < 1e-6, "{} - {}", e.pos, e.end);
+}
+
+/// Media & Disk Cache: peaks of an opened file are saved in the media cache and read back the
+/// next time; the cache keeps under its limit.
+#[test]
+fn peak_files_are_cached_and_pruned() {
+    let dir = std::env::temp_dir().join(format!("ac-peaks-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let wav = dir.join("tone.wav");
+    let d = crate::dsp::gen_tone(48000, 2, 0.5, 440.0, crate::dsp::Wave::Sine, -6.0);
+    crate::audio::save_wav(&wav, &d, 16, false).unwrap();
+    let data = crate::audio::load(&wav).unwrap().data;
+    let mut p = crate::prefs::Prefs::default();
+    p.save_peak_files = true;
+    crate::prefs::set_live(&p);
+    let built = crate::peakcache::peaks_for(&wav, &data);
+    let cached = crate::peakcache::load(&wav, &data).expect("saved in the cache");
+    assert_eq!(cached.levels, built.levels, "the same peaks come back");
+    // a changed file is not mistaken for the old one
+    let d2 = crate::dsp::gen_tone(48000, 2, 0.4, 440.0, crate::dsp::Wave::Sine, -6.0);
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    crate::audio::save_wav(&wav, &d2, 16, false).unwrap();
+    let data2 = crate::audio::load(&wav).unwrap().data;
+    assert!(crate::peakcache::load(&wav, &data2).is_none(), "the changed file has no cache yet");
+    // the limit
+    crate::peakcache::prune(0);
+    assert!(crate::peakcache::load(&wav, &data).is_none());
+    crate::prefs::set_live(&crate::prefs::Prefs::default());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Bus tracks: a track's output can go into a bus (which then has the last word with its own
+/// fader), a send adds a copy of the track into a bus, a soloed track's bus stays audible,
+/// and renaming a bus keeps every route to it.
+#[test]
+fn busses_take_outputs_and_sends() {
+    let h = Harness::new(true, true);
+    let mut s = h.app.session.clone().unwrap();
+    let files = &h.app.files;
+    let look = |id: u64| files.iter().find(|f| f.id == id).map(|f| f.data.clone());
+    let peak = |s: &crate::session::Session| -> f32 {
+        let mix = s.snapshot(&look);
+        let d = crate::session::mixdown(&mix, s.rate, 0.5, 0.7);
+        d.ch[0].iter().fold(0.0f32, |m, v| m.max(v.abs()))
+    };
+    // only the beat track (track 2) plays
+    s.tracks[0].mute = true;
+    let alone = peak(&s);
+    assert!(alone > 1e-3);
+    let b = s.add_bus();
+    let bid = s.tracks[b].id;
+    let key = crate::session::Session::bus_name_for(bid);
+    assert_eq!(s.busses(), vec![(bid, "Bus 1".to_string())]);
+    // the whole track into the bus: the bus fader decides
+    s.tracks[1].io.output = key.clone();
+    assert!((peak(&s) - alone).abs() < 1e-3, "through a unity bus it sounds the same");
+    s.tracks[b].volume_db = -60.0;
+    assert!(peak(&s) < alone * 0.01, "the bus fader turns it down");
+    s.tracks[b].volume_db = 0.0;
+    // a send: the track to the Master and a copy into the bus
+    s.tracks[1].io.output = "Master".into();
+    s.tracks[1].send.on = true;
+    s.tracks[1].send.target = key.clone();
+    s.tracks[1].send.level_db = 0.0;
+    let both = peak(&s);
+    assert!((both / alone - 2.0).abs() < 0.05, "track + its send: twice as loud ({both} vs {alone})");
+    s.tracks[1].send.on = false;
+    assert!((peak(&s) - alone).abs() < 1e-3, "a send switched off adds nothing");
+    s.tracks[1].send.on = true;
+    // solo the track: its bus stays audible
+    s.tracks[1].solo = true;
+    assert!((peak(&s) / alone - 2.0).abs() < 0.05, "the soloed track's bus is still heard");
+    // a renamed bus keeps its routes
+    s.tracks[b].name = "Reverb Bus".into();
+    assert_eq!(s.route_label(&s.tracks[1].send.target), "Reverb Bus");
+    assert!((peak(&s) / alone - 2.0).abs() < 0.05);
+    // a bus never feeds itself
+    s.tracks[b].io.output = key.clone();
+    let mix = s.snapshot(&look);
+    assert_eq!(mix.tracks[b].to_bus, None);
 }

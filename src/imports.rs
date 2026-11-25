@@ -51,7 +51,7 @@ impl ImportQueue {
                 .map_err(|e| format!("Could not read {}: {e}", path.display()))?;
             // Peaks are much larger than a waveform pixel column and are built once, here,
             // rather than while the person is waiting for the first responsive frame.
-            let peaks = Peaks::build(&loaded.data);
+            let peaks = crate::peakcache::peaks_for(&path, &loaded.data);
             Ok(PreparedImport {
                 data: loaded.data,
                 bits: loaded.bits,

@@ -12,6 +12,7 @@ use egui::{Color32, FontId, Pos2, Rect, Sense, Stroke, pos2, vec2};
 /// settings (the magnet menu in the Multitrack Tools corner, Preferences > Multitrack).
 /// `span`/`width` are the visible timeline span and lane width, so the time-display targets
 /// are the ruler's labelled (major) marks; `view` is the visible time range.
+#[cfg(test)]
 pub fn collect_snap_targets(
     s: &crate::session::Session,
     p: &crate::prefs::Prefs,
@@ -209,6 +210,16 @@ pub struct MultiDrag {
     pub key_hovered: bool,
     /// Where each keyframe was drawn last frame (for tests and hit checks).
     pub key_spots: Vec<(crate::keys::EnvTarget, usize, egui::Pos2)>,
+    /// The floating readout beside the pointer while a value is dragged (keyframe, handle,
+    /// clip gain): where, and what it says. Set during the drag, drawn once per frame.
+    pub readout: Option<(egui::Pos2, String)>,
+    /// Precision dragging (Ctrl held): the real pointer last frame and the slowed "virtual"
+    /// pointer the drag follows. `None` while no button is held.
+    pub fine: Option<(egui::Pos2, egui::Pos2)>,
+    /// Where the pointer button went down this frame's drag (for precision dragging).
+    pub press_origin: Option<egui::Pos2>,
+    /// Where each keyframe's curve handles were drawn last frame (target, index, in-side, pos).
+    pub handle_spots: Vec<(crate::keys::EnvTarget, usize, bool, egui::Pos2)>,
     /// Where each Multitrack Tools button was drawn last frame (for tests and hit checks).
     pub tool_spots: Vec<(u8, Rect)>,
     /// The corner panel the Multitrack Tools sit in last frame (for tests and hit checks).
@@ -813,7 +824,26 @@ fn small_glyph(ui: &mut egui::Ui, g: Glyph) {
     }
 }
 
+/// How much slower a drag follows the mouse while Ctrl is held (precision dragging).
+pub const FINE_DRAG: f32 = 0.2;
+
 impl App {
+    /// The pointer a drag follows: the real one, or with Ctrl held one that moves at
+    /// [`FINE_DRAG`] of the mouse's speed. Switching Ctrl during a drag never jumps: only the
+    /// mouse's movement from then on is slowed.
+    pub fn fine_pos(&mut self, real: egui::Pos2, ctrl: bool) -> egui::Pos2 {
+        // a new drag starts from where the button went down, so the few pixels before the drag
+        // was recognised are slowed too
+        let (last, virt) = self.multi_drag.fine.unwrap_or_else(|| {
+            let o = self.multi_drag.press_origin.unwrap_or(real);
+            (o, o)
+        });
+        let k = if ctrl { FINE_DRAG } else { 1.0 };
+        let virt = virt + (real - last) * k;
+        self.multi_drag.fine = Some((real, virt));
+        virt
+    }
+
     fn vertical_navigator(
         &mut self,
         ui: &mut egui::Ui,
@@ -957,6 +987,7 @@ impl App {
                     t.height = (t.height * k).clamp(40.0, 600.0);
                 }
             }
+            self.keep_heights_out_of_undo();
             self.multi_drag.scroll_y = 0.0;
             height_k = 1.0;
         }
@@ -966,6 +997,8 @@ impl App {
                     t.height = (t.height * height_k).clamp(40.0, 600.0);
                 }
             }
+            // the navigator's grips and wheel only change the view: never an undo step
+            self.keep_heights_out_of_undo();
             let a = view_h * anchor;
             self.multi_drag.scroll_y = ((self.multi_drag.scroll_y + a) * height_k - a).max(0.0);
         }
@@ -1023,16 +1056,23 @@ impl App {
     }
 
     /// Recording inputs offered on the track headers.
+    /// The inputs a track can record from: every pair and every single input the input
+    /// device has ("Stereo In 3/4", "Mono In 5").
     pub fn input_choices(&self) -> Vec<String> {
-        let mut v = vec![
-            "Default Stereo Input".to_string(),
-            "Mono: Left".to_string(),
-            "Mono: Right".to_string(),
-        ];
-        if self.engine.in_device_name != "(none)" {
-            v.push(format!("Stereo: {}", self.engine.in_device_name));
-        }
+        let n = self.engine.input_channel_count().max(1);
+        let mut v: Vec<String> = (0..n / 2)
+            .map(|p| format!("Stereo In {}/{}", 2 * p + 1, 2 * p + 2))
+            .collect();
+        v.extend((0..n).map(|c| format!("Mono In {}", c + 1)));
         v
+    }
+
+    /// The hardware output pairs a track can go straight to ("Out 3/4").
+    pub fn output_pairs(&self) -> Vec<String> {
+        let n = self.engine.lock().out_channels.max(2);
+        (0..n / 2)
+            .map(|p| format!("Out {}/{}", 2 * p + 1, 2 * p + 2))
+            .collect()
     }
 }
 
@@ -1043,7 +1083,7 @@ fn fit_text(ui: &egui::Ui, text: &str, max_w: f32) -> String {
     crate::panels::middle_ellipsis(ui.painter(), text, font, max_w.max(20.0))
 }
 
-/// Vertical fader in dB (-60..+6). Returns (changed, released).
+/// Vertical fader in dB, over the track volume range (-60..+15). Returns (changed, released).
 fn fader(ui: &mut egui::Ui, rect: Rect, db: &mut f32) -> (bool, bool) {
     let resp = ui.interact(
         rect,
@@ -1052,21 +1092,23 @@ fn fader(ui: &mut egui::Ui, rect: Rect, db: &mut f32) -> (bool, bool) {
         Sense::click_and_drag(),
     );
     let to_pos = |d: f32| -> f32 {
-        let d = d.clamp(-60.0, 6.0);
+        let (lo, hi) = (crate::session::TRACK_DB_MIN, crate::session::TRACK_DB_MAX);
+        let d = d.clamp(lo, hi);
         // a gentle curve: more resolution near 0 dB
         let t = if d >= -12.0 {
-            0.55 + (d + 12.0) / 18.0 * 0.45
+            0.55 + (d + 12.0) / (hi + 12.0) * 0.45
         } else {
-            (d + 60.0) / 48.0 * 0.55
+            (d - lo) / (-12.0 - lo) * 0.55
         };
         rect.bottom() - 8.0 - t * (rect.height() - 16.0)
     };
     let from_pos = |y: f32| -> f32 {
+        let (lo, hi) = (crate::session::TRACK_DB_MIN, crate::session::TRACK_DB_MAX);
         let t = ((rect.bottom() - 8.0 - y) / (rect.height() - 16.0)).clamp(0.0, 1.0);
         if t >= 0.55 {
-            -12.0 + (t - 0.55) / 0.45 * 18.0
+            -12.0 + (t - 0.55) / 0.45 * (hi + 12.0)
         } else {
-            -60.0 + t / 0.55 * 48.0
+            lo + t / 0.55 * (-12.0 - lo)
         }
     };
     let mut changed = false;
@@ -1087,6 +1129,7 @@ fn fader(ui: &mut egui::Ui, rect: Rect, db: &mut f32) -> (bool, bool) {
     );
     p.rect_filled(groove, 0.0, crate::theme::gray(15));
     for (d, l) in [
+        (15.0, "+15"),
         (6.0, "+6"),
         (0.0, "0"),
         (-6.0, "-6"),
@@ -1191,7 +1234,7 @@ impl App {
             .fixed_pos(panel.min)
             .show(ui.ctx(), |ui| {
                 ui.set_width(panel.width());
-                if self.show_tools_window {
+                if self.show_multitrack_tools {
                     let row = Rect::from_min_max(
                         pos2(panel.left() + 2.0, panel.top() + 5.0),
                         pos2(panel.right() - 2.0, panel.bottom() - 5.0),
@@ -1315,6 +1358,11 @@ impl App {
 
     pub fn multitrack_view(&mut self, ui: &mut egui::Ui) {
         self.keys_take_selection();
+        self.multi_drag.readout = None;
+        if !ui.input(|i| i.pointer.any_down()) {
+            self.multi_drag.fine = None;
+        }
+        self.multi_drag.press_origin = ui.input(|i| i.pointer.press_origin());
         self.multi_drag.tool_spots.clear();
         let full = ui.max_rect();
         let p = ui.painter_at(full);
@@ -1518,10 +1566,11 @@ impl App {
         // ---------- ruler
         draw_ruler(&p, ruler, view.0, view.1);
         // the pre-render gauge: a thin bar along the ruler's top edge (like a video editor's
-        // render bar) whenever a track has Pre-render on. It follows the render window: faded
-        // over the stretch the renders aim to hold (the whole session when it fits the cache
-        // cap, otherwise around the playhead), filled where every pre-rendered track is
-        // ready, with the moving edge marked; all in the theme's colours
+        // render bar) whenever a track has Pre-render on. It covers the session, from the first
+        // clip to the last: faded over what the renders aim to hold (the whole session when it
+        // fits the cache cap, otherwise the stretch around the playhead), filled where every
+        // pre-rendered track is ready, with a running render's edge marked; all in the theme's
+        // colours
         if let Some(g) = self.prerender_gauge() {
             let bar = Rect::from_min_max(ruler.min, pos2(ruler.right(), ruler.top() + 4.0));
             self.multi_drag.prerender_bar = Some(bar);
@@ -1532,21 +1581,31 @@ impl App {
                     pos2(clip_x(x_of(b)), bar.bottom()),
                 )
             };
-            let w = span_rect(g.window.0, g.window.1);
-            if w.width() > 0.0 {
-                p.rect_filled(w, 0.0, theme::render_todo());
+            let (wa, wb) = (g.window.0.max(g.span.0), g.window.1.min(g.span.1));
+            if wb > wa {
+                let w = span_rect(wa, wb);
+                if w.width() > 0.0 {
+                    p.rect_filled(w, 0.0, theme::render_todo());
+                }
             }
-            let d = span_rect(g.rendered.0, g.rendered.1);
-            if d.width() > 0.0 {
-                p.rect_filled(d, 0.0, theme::render_done());
+            for &(a, b) in &g.ready {
+                let d = span_rect(a, b);
+                if d.width() > 0.0 {
+                    p.rect_filled(d, 0.0, theme::render_done());
+                }
             }
-            let xr = x_of(g.rendered.1);
-            if g.busy && xr >= bar.left() && xr <= bar.right() {
-                p.rect_filled(
-                    Rect::from_min_max(pos2(xr - 1.0, bar.top()), pos2(xr + 1.0, bar.bottom() + 1.0)),
-                    0.0,
-                    theme::render_edge(),
-                );
+            if let Some(e) = g.edge {
+                let xr = x_of(e);
+                if xr >= bar.left() && xr <= bar.right() {
+                    p.rect_filled(
+                        Rect::from_min_max(
+                            pos2(xr - 1.0, bar.top()),
+                            pos2(xr + 1.0, bar.bottom() + 1.0),
+                        ),
+                        0.0,
+                        theme::render_edge(),
+                    );
+                }
             }
             let hover = ui.interact(
                 Rect::from_min_max(bar.min, pos2(bar.right(), bar.bottom() + 2.0)),
@@ -1560,18 +1619,26 @@ impl App {
             );
             let fmt = self.time_format;
             let rate = self.rate();
-            let when = format!(
-                "{} - {}",
-                fmt.format(g.rendered.0, rate),
-                fmt.format(g.rendered.1, rate)
-            );
+            let ready = if g.ready.is_empty() {
+                "nothing yet".to_string()
+            } else {
+                g.ready
+                    .iter()
+                    .take(3)
+                    .map(|(a, b)| format!("{} - {}", fmt.format(*a, rate), fmt.format(*b, rate)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+                    + if g.ready.len() > 3 { ", ..." } else { "" }
+            };
             hover.on_hover_text(format!(
-                "{}\nReady: {when}\nCache: {:.0} of {:.0} MB",
+                "{}\nReady: {ready}\nSession: {} - {}\nCache: {:.0} of {:.0} MB",
                 if g.busy {
                     format!("Pre-rendering {tracks}: {:.0}%", g.progress * 100.0)
                 } else {
                     format!("{tracks} pre-rendered")
                 },
+                fmt.format(g.span.0, rate),
+                fmt.format(g.span.1, rate),
                 g.megabytes,
                 g.cap_megabytes
             ));
@@ -1802,7 +1869,10 @@ impl App {
             .tracks
             .iter()
             .map(|t| t.shown_height())
-            .sum();
+            .sum::<f32>()
+            // blank room under the last track, like the time after the session's end: the
+            // last track can be scrolled up away from the bottom edge
+            + (tracks_rect.height() * 0.4).max(60.0);
         let max_scroll = (total_h - tracks_rect.height()).max(0.0);
         self.multi_drag.scroll_y = self.multi_drag.scroll_y.clamp(0.0, max_scroll);
         let mut y = tracks_rect.top() - self.multi_drag.scroll_y;
@@ -1981,7 +2051,7 @@ impl App {
             )));
             hui.set_clip_rect(tracks_rect.intersect(head));
             let in_names = self.input_choices();
-            let out_dev = self.engine.out_device_name.clone();
+            let out_pairs = self.output_pairs();
             let view_mode = self.header_view;
             let s_rate = self
                 .session
@@ -1991,6 +2061,16 @@ impl App {
             let rack_open = &mut want_slot;
             let eq_open = &mut want_eq;
             let s = self.session.as_mut().unwrap();
+            // the bus tracks this track can feed (never itself; a bus feeds only the Master)
+            let own_id = s.tracks[ti].id;
+            let is_bus = s.tracks[ti].bus;
+            let busses: Vec<(u64, String)> = if is_bus {
+                vec![]
+            } else {
+                s.busses().into_iter().filter(|(id, _)| *id != own_id).collect()
+            };
+            let out_label = s.route_label(&s.tracks[ti].io.output);
+            let send_label = s.route_label(&s.tracks[ti].send.target);
             let tr = &mut s.tracks[ti];
             let mut touched = false;
             hui.spacing_mut().item_spacing.y = 3.0;
@@ -2056,7 +2136,14 @@ impl App {
                 }
             });
             if !minimized {
+                // Shrinking a track hides its rows in this order: the middle rows (inputs/
+                // outputs, effects, sends, EQ) first, then the automation row (the lane's
+                // arrow and Read), and the volume/pan row last: it has the highest priority
+                // after the name. An open lane keeps its automation row.
+                let vol_fits = head.height() >= 54.0;
+                let auto_fits = head.height() >= 84.0 || lane_h > 0.0;
                 // row 2: volume and pan
+                if vol_fits {
                 hui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 3.0;
                     small_glyph(ui, Glyph::Volume);
@@ -2064,16 +2151,16 @@ impl App {
                     let k = theme::knob(
                         ui,
                         &mut v,
-                        -60.0,
-                        15.0,
+                        crate::session::TRACK_DB_MIN,
+                        crate::session::TRACK_DB_MAX,
                         20.0,
                         "Volume (drag, double-click resets)",
                     );
                     let hv = theme::hot_value(
                         ui,
                         &mut v,
-                        -60.0,
-                        15.0,
+                        crate::session::TRACK_DB_MIN,
+                        crate::session::TRACK_DB_MAX,
                         0.1,
                         0.0,
                         &format!("{:+.1}", tr.volume_db),
@@ -2155,10 +2242,12 @@ impl App {
                         hist = Some("Track Channels");
                     }
                 });
+                }
                 // the middle: inputs/outputs, effects, sends or EQ (header toolbar choice)
-                let show_auto = head.height() >= 118.0 || lane_h > 0.0;
+                let show_auto = auto_fits;
                 let body_h = (head.bottom() - 30.0 - hui.cursor().top()).max(0.0);
-                if body_h >= 18.0 {
+                // the middle rows only once the automation row has its room
+                if body_h >= 18.0 && show_auto {
                     match view_mode {
                         1 => {
                             // effects: the rack's slots, each with its power switch
@@ -2223,7 +2312,7 @@ impl App {
                                     egui::Button::new(
                                         egui::RichText::new(fit_text(
                                             ui,
-                                            &format!("S1: {}", tr.send.target),
+                                            &format!("S1: {send_label}"),
                                             w - 22.0,
                                         ))
                                         .small(),
@@ -2239,10 +2328,31 @@ impl App {
                                         tr.send.target = "None".into();
                                         ui.close();
                                     }
-                                    ui.add_enabled(
-                                        false,
-                                        egui::Button::new("Bus (add a bus track first)"),
-                                    );
+                                    if busses.is_empty() {
+                                        ui.add_enabled(
+                                            false,
+                                            egui::Button::new(if is_bus {
+                                                "A bus sends nowhere: it goes to the Master"
+                                            } else {
+                                                "No bus yet (Multitrack > Track > Add Stereo Bus Track)"
+                                            }),
+                                        );
+                                    }
+                                    for (bid, bname) in &busses {
+                                        let key = crate::session::Session::bus_name_for(*bid);
+                                        if ui.selectable_label(tr.send.target == key, bname).clicked() {
+                                            tr.send.target = key;
+                                            // a send to a bus is meant to be heard: on, and at
+                                            // unity if it was still at its silent default
+                                            tr.send.on = true;
+                                            if tr.send.level_db <= -90.0 {
+                                                tr.send.level_db = 0.0;
+                                            }
+                                            touched = true;
+                                            hist = Some("Track Send");
+                                            ui.close();
+                                        }
+                                    }
                                 });
                             });
                             if body_h >= 40.0 {
@@ -2444,7 +2554,7 @@ impl App {
                                         egui::Button::new(
                                             egui::RichText::new(fit_text(
                                                 ui,
-                                                &tr.io.output,
+                                                &out_label,
                                                 w - 22.0,
                                             ))
                                             .small(),
@@ -2462,26 +2572,43 @@ impl App {
                                             ui.separator();
                                         }
                                         ui.menu_button("Bus", |ui| {
-                                            ui.add_enabled(
-                                                false,
-                                                egui::Button::new("No busses in this session"),
-                                            );
-                                        });
-                                        ui.separator();
-                                        ui.menu_button("Stereo", |ui| {
-                                            let n = format!("Stereo: {out_dev}");
-                                            if ui.selectable_label(tr.io.output == n, &n).clicked()
-                                            {
-                                                tr.io.output = n.clone();
-                                                touched = true;
-                                                ui.close();
+                                            if busses.is_empty() {
+                                                ui.add_enabled(
+                                                    false,
+                                                    egui::Button::new(if is_bus {
+                                                        "A bus goes to the Master"
+                                                    } else {
+                                                        "No bus yet (Multitrack > Track > Add Stereo Bus Track)"
+                                                    }),
+                                                );
+                                            }
+                                            for (bid, bname) in &busses {
+                                                let key = crate::session::Session::bus_name_for(*bid);
+                                                if ui
+                                                    .selectable_label(tr.io.output == key, bname)
+                                                    .on_hover_text("The whole track goes into this bus instead of the Master")
+                                                    .clicked()
+                                                {
+                                                    tr.io.output = key;
+                                                    touched = true;
+                                                    hist = Some("Track Output");
+                                                    ui.close();
+                                                }
                                             }
                                         });
-                                        ui.menu_button("5.1", |ui| {
-                                            ui.add_enabled(
-                                                false,
-                                                egui::Button::new("No 5.1 output"),
-                                            );
+                                        ui.separator();
+                                        ui.menu_button("Hardware output", |ui| {
+                                            for n in out_pairs.iter() {
+                                                if ui
+                                                    .selectable_label(tr.io.output == *n, n)
+                                                    .on_hover_text("Straight to these outputs of your audio interface, skipping the Master (mixdowns and exports still include the track)")
+                                                    .clicked()
+                                                {
+                                                    tr.io.output = n.clone();
+                                                    touched = true;
+                                                    ui.close();
+                                                }
+                                            }
                                         });
                                         ui.separator();
                                         if ui.button("Audio Hardware...").clicked() {
@@ -3923,6 +4050,15 @@ impl App {
         if resp.dragged() && !middle {
             if let Some(pp) = resp.interact_pointer_pos() {
                 let drag = self.multi_drag.drag;
+                // the readout stays by the real pointer
+                let real_pp = pp;
+                // Ctrl held: clips, edges, fades and gain follow the mouse at a fifth of its speed
+                let pp = if drag.is_object_drag() {
+                    let ctrl = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
+                    self.fine_pos(pp, ctrl)
+                } else {
+                    pp
+                };
                 // Shift locks the drag to the main 8 directions: a clip, keyframe or handle
                 // grabbed with Shift moves along one straight line only, so a mostly-upward
                 // drag moves straight up and a mostly-rightward one straight right
@@ -4136,6 +4272,14 @@ impl App {
                     MDrag::ClipGain { id, y0, db0 } => {
                         if let Some(c) = s.clip_mut(id) {
                             c.gain_db = clip_gain_drag(db0, y0, pp.y);
+                            self.multi_drag.readout = Some((
+                                real_pp,
+                                format!(
+                                    "Clip gain {:+.1} dB   ({:+.1} dB)",
+                                    c.gain_db,
+                                    c.gain_db - db0
+                                ),
+                            ));
                             s.touch();
                             self.multi_drag.changed = true;
                         }
@@ -4175,6 +4319,13 @@ impl App {
                                     (t - c.start).max(lo).min(hi),
                                     env_db_at(body, pp.y) - c.gain_db,
                                 );
+                                self.multi_drag.readout = Some((
+                                    real_pp,
+                                    crate::keys::value_text(
+                                        crate::keys::VKind::Vol,
+                                        c.env[idx].1 + c.gain_db,
+                                    ),
+                                ));
                                 s.touch();
                                 self.multi_drag.changed = true;
                             }
@@ -4205,6 +4356,10 @@ impl App {
                                 let g = ((body.bottom() - pp.y) / body.height().max(1.0))
                                     .clamp(0.0, 1.0);
                                 pts[idx] = (if hi > lo { x.clamp(lo, hi) } else { lo }, g);
+                                self.multi_drag.readout = Some((
+                                    real_pp,
+                                    crate::keys::value_text(crate::keys::VKind::Fade, g),
+                                ));
                                 s.touch();
                                 self.multi_drag.changed = true;
                             }
@@ -4224,6 +4379,13 @@ impl App {
                                 };
                                 c.pan_env[idx] =
                                     ((t - c.start).max(lo).min(hi), pan_at(body, pp.y));
+                                self.multi_drag.readout = Some((
+                                    real_pp,
+                                    crate::keys::value_text(
+                                        crate::keys::VKind::Pan,
+                                        c.pan_env[idx].1,
+                                    ),
+                                ));
                                 s.touch();
                                 self.multi_drag.changed = true;
                             }
@@ -4634,10 +4796,16 @@ impl App {
             let (scroll, zoom_d, mods) =
                 ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta(), i.modifiers));
             let hp = ui.ctx().pointer_hover_pos().unwrap_or(lanes.center());
-            if mods.alt {
-                self.multi_drag.scroll_y -= scroll.y;
-            } else if hp.x < lanes.left() {
-                // over the track headers the wheel resizes every track, like the original
+            if mods.alt || hp.x < lanes.left() {
+                // over the track headers (or anywhere with Alt held) the wheel resizes every
+                // track, like the original; the plain wheel already scrolls them up and down
+                // Alt can turn a vertical wheel sideways on some systems: take either axis
+                let wheel = if scroll.y.abs() >= scroll.x.abs() {
+                    scroll.y
+                } else {
+                    scroll.x
+                };
+                let scroll = egui::vec2(0.0, wheel);
                 if scroll.y.abs() > 0.1 {
                     let k = (1.0025f32).powf(scroll.y);
                     let mut resized = false;
@@ -4649,7 +4817,9 @@ impl App {
                         }
                     }
                     if resized {
-                        self.session_push("Resize Tracks");
+                        // scrolling the track heights is a view change, not an edit: it is
+                        // never logged in the undo history
+                        self.keep_heights_out_of_undo();
                     }
                 }
             } else {
@@ -5023,6 +5193,13 @@ impl App {
         if let Some(h) = self.key_layer(ui, &key_views, &key_painter) {
             hist = Some(h);
         }
+        // the floating readout of the value being dragged, above everything
+        if let Some((at, text)) = self.multi_drag.readout.clone() {
+            let fine = self.multi_drag.fine.is_some()
+                && ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
+            let text = if fine { format!("{text}\nfine (Ctrl)") } else { text };
+            theme::drag_readout(ui.ctx(), at, &text);
+        }
 
         // the take being recorded grows on every armed track as it comes in
         if let Some((at, Some(_))) = self.recording_at {
@@ -5070,7 +5247,9 @@ impl App {
         if self.snapping && resp.dragged() {
             let snap_x = match self.multi_drag.drag {
                 MDrag::Move { id, grab, .. } => {
-                    if let Some(pp) = resp.interact_pointer_pos() {
+                    // the same (possibly slowed) pointer the drag itself follows
+                    let fine_pp = self.multi_drag.fine.map(|f| f.1);
+                    if let Some(pp) = fine_pp.or(resp.interact_pointer_pos()) {
                         let len = self
                             .session
                             .as_ref()

@@ -590,6 +590,12 @@ pub const COMMANDS: &[Cmd] = cmds![
         "Add a stereo track to the session."
     ),
     (
+        "track.add_bus",
+        "Add Stereo Bus Track",
+        "",
+        "Add a bus track: other tracks' sends and outputs can feed it (their Sends view and output menu), and it goes on to the Master with its own effects and fader."
+    ),
+    (
         "track.add_mono",
         "Add Mono Track",
         "",
@@ -1319,7 +1325,7 @@ impl App {
             "window.workspace_reset" => self.ws.reset(),
             "window.workspace_save" => self.ws.save_current(),
             "view.toggle_snapping" => self.snapping = !self.snapping,
-            "view.multitrack_tools" => self.show_tools_window = !self.show_tools_window,
+            "view.multitrack_tools" => self.show_multitrack_tools = !self.show_multitrack_tools,
             "view.toggle_auto_scroll" => self.auto_scroll = !self.auto_scroll,
             "view.theme_toggle" => {
                 // the next theme in the list, round to the first
@@ -1423,6 +1429,14 @@ impl App {
                 self.rack_clip_tab = id == "window.clip_effects";
             }
             "clip.mixdown_new" => self.mixdown(false, false),
+            "track.add_bus" => {
+                self.ensure_session();
+                if let Some(s) = self.session.as_mut() {
+                    s.add_bus();
+                }
+                self.session_push("Add Bus Track");
+                self.switch_mode(Mode::Multitrack);
+            }
             "track.add_stereo" | "track.add_mono" => {
                 self.ensure_session();
                 if let Some(s) = self.session.as_mut() {
