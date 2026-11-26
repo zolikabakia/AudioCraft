@@ -1,5 +1,12 @@
 # AudioCraft
 
+> **Notice: this version is NOT based on the CraftLibs library.**
+> This repository is the original, standalone AudioCraft. Its interface, audio I/O and DSP are its own
+> code (plus the vendored SoundCraft crates in `vendor/`); it does not use
+> [craft-libs](https://github.com/storytold/craft-libs) (`craft-ui`, `craft-audio`, `craft-theme`, ...).
+> The rebuild on top of CraftLibs lives in a separate repository:
+> [AudioCraft-CraftLibs](https://github.com/zolikabakia/AudioCraft-CraftLibs).
+
 A native Rust audio editor and multitrack mixer (eframe/egui, no web views). It follows the
 ArtCraft guidelines: familiar professional layout and shortcuts, local files only, every feature is a
 documented command, MIT licensed. It was built clean-room from public knowledge only.
