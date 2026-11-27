@@ -1,0 +1,2 @@
+# vendored crates are checked against .cargo-checksum.json: keep their bytes exactly (no CRLF conversion)
+vendor/crates/** -text
